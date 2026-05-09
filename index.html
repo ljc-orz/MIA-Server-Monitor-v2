@@ -1,0 +1,1326 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Server Resource Monitor</title>
+  <style>
+    body {
+      margin: 0;
+      color: #111111;
+      font-family: monospace;
+      background-color: #ffffff;
+    }
+
+    .top-banner {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 10px 14px;
+      background: linear-gradient(90deg, #111111 0%, #2b2b2b 100%);
+      color: #ffffff;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 700;
+      flex-wrap: wrap;
+    }
+
+    .top-banner a {
+      color: #facc15;
+      text-decoration: underline;
+    }
+
+    .top-banner a:hover {
+      color: #fde68a;
+    }
+
+    h1,
+    h2,
+    h3 {
+      text-align: center;
+      margin: 0;
+    }
+
+    h1 {
+      margin-top: 14px;
+      margin-bottom: 8px;
+      font-size: 34px;
+    }
+
+    h2 {
+      margin-top: 6px;
+      margin-bottom: 10px;
+      font-size: 20px;
+    }
+
+    .server-title {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status-lamp {
+      width: 11px;
+      height: 11px;
+      border-radius: 999px;
+      display: inline-block;
+      border: 1px solid rgba(0, 0, 0, 0.2);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15);
+      flex-shrink: 0;
+      background: #9ca3af;
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12), inset 0 0 4px rgba(0, 0, 0, 0.25);
+    }
+
+    .status-lamp.flash-online {
+      animation: lampFlashOnline 1s cubic-bezier(0.2, 0.7, 0.2, 1) 1;
+    }
+
+    @keyframes lampFlashOnline {
+      0% {
+        transform: scale(0.9);
+        filter: brightness(1);
+        background: #9ca3af;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12), inset 0 0 4px rgba(0, 0, 0, 0.25);
+      }
+
+      16% {
+        transform: scale(1.34);
+        filter: brightness(1.62);
+        background: #22c55e;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2), 0 0 16px rgba(34, 197, 94, 0.95);
+      }
+
+      30% {
+        transform: scale(1.18);
+        filter: brightness(1.45);
+        background: #32c76a;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2), 0 0 14px rgba(34, 197, 94, 0.86);
+      }
+
+      46% {
+        transform: scale(1.1);
+        filter: brightness(1.3);
+        background: #52c983;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18), 0 0 10px rgba(34, 197, 94, 0.65);
+      }
+
+      62% {
+        transform: scale(1.02);
+        filter: brightness(1.14);
+        background: #79cb9e;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16), 0 0 7px rgba(34, 197, 94, 0.44);
+      }
+
+      78% {
+        transform: scale(1.01);
+        filter: brightness(1.06);
+        background: #93bba7;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.14), 0 0 3px rgba(34, 197, 94, 0.18);
+      }
+
+      100% {
+        transform: scale(1);
+        filter: brightness(1);
+        background: #9ca3af;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12), inset 0 0 4px rgba(0, 0, 0, 0.25);
+      }
+    }
+
+    .toolbar {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+
+    .toolbar button {
+      padding: 6px 14px;
+      border: 1px solid #999999;
+      border-radius: 6px;
+      background: #f5f5f5;
+      color: #111111;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    .toolbar button.active {
+      background: #111111;
+      color: #ffffff;
+    }
+
+    .container {
+      width: 100%;
+      margin: 0 auto;
+      padding: 0 12px;
+      box-sizing: border-box;
+    }
+
+    .row-container {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: stretch;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .resource-card-title {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 700;
+      color: #111111;
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .resource-card-subtitle {
+      font-size: 12px;
+      color: #333333;
+      font-weight: 400;
+    }
+
+    .resource-summary {
+      width: 96%;
+      margin: 6px auto 4px;
+      font-size: 12px;
+      color: #333333;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: center;
+    }
+
+    .toast {
+      position: fixed;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%) scale(0.98);
+      padding: 14px 20px;
+      border-radius: 12px;
+      background: rgba(17, 17, 17, 0.92);
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 600;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s ease, transform 0.2s ease;
+      z-index: 1000;
+    }
+
+    .toast.visible {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+
+    .resource-controls {
+      display: none;
+      width: 100%;
+      margin: 0 auto 12px;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .resource-controls.visible {
+      display: flex;
+    }
+
+    .resource-controls select {
+      min-width: 280px;
+      max-width: min(92vw, 420px);
+      width: 100%;
+      padding: 10px 44px 10px 14px;
+      border: 1px solid #9aa0a6;
+      border-radius: 8px;
+      background:
+        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 18 18' fill='none'%3E%3Cpath d='M4 7l5 5 5-5' stroke='%23444' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+        no-repeat right 14px center,
+        linear-gradient(180deg, #ffffff 0%, #f2f2f2 100%);
+      color: #111111;
+      font: inherit;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      box-shadow: 0 6px 16px rgba(0, 0, 0, 0.08);
+      outline: none;
+      transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+      appearance: none;
+      -webkit-appearance: none;
+      -moz-appearance: none;
+      text-align-last: center;
+    }
+
+    .resource-controls select:hover {
+      transform: translateY(-1px);
+      border-color: #70757a;
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.12);
+    }
+
+    .resource-controls select:focus {
+      border-color: #111111;
+      box-shadow: 0 0 0 3px rgba(17, 17, 17, 0.12), 0 10px 24px rgba(0, 0, 0, 0.12);
+      background:
+        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 18 18' fill='none'%3E%3Cpath d='M4 7l5 5 5-5' stroke='%23111' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+        no-repeat right 14px center,
+        linear-gradient(180deg, #ffffff 0%, #f2f2f2 100%);
+    }
+
+    .dev_box2 {
+      display: block;
+      width: calc(50% - 6px);
+      margin: 0;
+      align-items: center;
+      box-sizing: border-box;
+      min-width: 0;
+    }
+
+    .terminal {
+      height: 300px;
+      width: 96%;
+      display: block;
+      border: 1px solid #cccccc;
+      margin: 0 auto;
+      background-color: black;
+      color: white;
+      font-family: monospace;
+      padding: 5px;
+      border-radius: 5px;
+      overflow-x: auto;
+      overflow-y: auto;
+      position: relative;
+    }
+
+    .terminal::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+
+    .terminal::-webkit-scrollbar-track {
+      background-color: #000000;
+    }
+
+    .terminal::-webkit-scrollbar-thumb {
+      background-color: #ffffff;
+      border-radius: 5px;
+    }
+
+    .terminal::-webkit-scrollbar-thumb:hover {
+      background-color: #555555;
+    }
+
+    .output {
+      margin: 0;
+      padding: 0;
+      white-space: pre;
+      word-break: break-all;
+      font-size: 14px;
+      min-width: max-content;
+    }
+
+    .terminal::after {
+      content: '|';
+      display: inline-block;
+      animation: blink 1s infinite;
+      pointer-events: none;
+    }
+
+    @keyframes blink {
+      50% {
+        opacity: 0;
+      }
+    }
+
+    .status-line,
+    .memory-summary {
+      width: 96%;
+      margin: 6px auto 4px;
+      font-size: 12px;
+      color: #333333;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: center;
+    }
+
+    .memory-bar {
+      width: 96%;
+      margin: 6px auto 4px;
+      height: 10px;
+      border: 1px solid #cccccc;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #f1f1f1;
+    }
+
+    .memory-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #22c55e, #f59e0b, #ef4444);
+    }
+
+    .memory-card {
+      width: 96%;
+      margin: 6px auto 0;
+      border: 1px solid #d8d8d8;
+      border-radius: 10px;
+      background: #fafafa;
+      padding: 10px;
+    }
+
+    .memory-card-title {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 700;
+      color: #111111;
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .memory-card-subtitle {
+      font-size: 12px;
+      color: #333333;
+      font-weight: 400;
+    }
+
+    .gpu-table {
+      width: 96%;
+      margin: 8px auto 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .gpu-row {
+      display: grid;
+      grid-template-columns: minmax(120px, 170px) minmax(0, 1fr) minmax(120px, 210px) minmax(108px, 124px);
+      gap: 10px;
+      align-items: center;
+      border: 1px solid #d8d8d8;
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #ffffff;
+    }
+
+    .gpu-row > div,
+    .gpu-env-button {
+      min-width: 0;
+    }
+
+    .gpu-id {
+      font-size: 15px;
+      font-weight: 700;
+      color: #111111;
+      text-align: center;
+    }
+
+    .gpu-subid {
+      margin-top: 3px;
+      font-size: 11px;
+      color: #666666;
+      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .gpu-name {
+      font-size: 13px;
+      color: #111111;
+      margin-bottom: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .gpu-progress {
+      height: 18px;
+      border: 1px solid #999999;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #f3f4f6;
+    }
+
+    .gpu-progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #22c55e 0%, #f59e0b 55%, #ef4444 100%);
+    }
+
+    .gpu-meta {
+      text-align: right;
+      font-size: 13px;
+      color: #0f172a;
+      font-weight: 700;
+      white-space: normal;
+      word-break: break-word;
+    }
+
+    .gpu-value-badge {
+      display: inline-block;
+      margin-top: 4px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid #cbd5e1;
+      background: #ffffff;
+      color: #0f172a;
+      font-size: 12px;
+      font-weight: 700;
+      max-width: 100%;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .gpu-metric-label {
+      margin-top: 4px;
+      font-size: 12px;
+      color: #666666;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .gpu-env-button {
+      justify-self: end;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 2px;
+      width: 118px;
+      padding: 8px 10px;
+      border: 1px solid #7f8c8d;
+      border-radius: 10px;
+      background: linear-gradient(180deg, #ffffff 0%, #eef2f7 100%);
+      color: #111111;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 6px 14px rgba(0, 0, 0, 0.10);
+      line-height: 1;
+      transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+      overflow: hidden;
+    }
+
+    .gpu-env-button:hover {
+      transform: translateY(-1px);
+      border-color: #4b5563;
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.14);
+    }
+
+    .gpu-env-button:focus {
+      outline: none;
+      box-shadow: 0 0 0 3px rgba(17, 17, 17, 0.10), 0 8px 18px rgba(0, 0, 0, 0.14);
+    }
+
+    .gpu-env-main {
+      font-size: 9px;
+      letter-spacing: 0.2px;
+      white-space: normal;
+      word-break: break-all;
+      line-height: 1.15;
+      text-align: center;
+      width: 100%;
+    }
+
+    .gpu-env-sub {
+      font-size: 10px;
+      font-weight: 600;
+      color: #374151;
+    }
+
+    .code-guide-panel {
+      width: min(1100px, 100%);
+      margin: 0 auto;
+      box-sizing: border-box;
+    }
+
+    .code-guide-grid {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 14px;
+    }
+
+    .code-block-card {
+      border: 1px solid #d8d8d8;
+      border-radius: 10px;
+      background: #fafafa;
+      overflow: hidden;
+    }
+
+    .code-block-header {
+      min-height: 42px;
+      padding: 8px 10px 8px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 1px solid #d8d8d8;
+      background: #ffffff;
+      box-sizing: border-box;
+    }
+
+    .code-block-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #111111;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .code-copy-button {
+      flex-shrink: 0;
+      padding: 7px 12px;
+      border: 1px solid #7f8c8d;
+      border-radius: 8px;
+      background: linear-gradient(180deg, #ffffff 0%, #eef2f7 100%);
+      color: #111111;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 5px 12px rgba(0, 0, 0, 0.10);
+    }
+
+    .code-copy-button:hover {
+      transform: translateY(-1px);
+      border-color: #4b5563;
+      box-shadow: 0 7px 16px rgba(0, 0, 0, 0.14);
+    }
+
+    .pretty-code {
+      margin: 0;
+      padding: 14px;
+      min-height: 52px;
+      max-height: 460px;
+      overflow: auto;
+      background: #0b1020;
+      color: #e5e7eb;
+      font-size: 13px;
+      line-height: 1.55;
+      white-space: pre;
+      tab-size: 4;
+    }
+
+    .pretty-code code {
+      font: inherit;
+    }
+
+    .syntax-keyword {
+      color: #93c5fd;
+      font-weight: 700;
+    }
+
+    .syntax-string {
+      color: #86efac;
+    }
+
+    .syntax-comment {
+      color: #94a3b8;
+      font-style: italic;
+    }
+
+    .syntax-number {
+      color: #fbbf24;
+    }
+
+    .syntax-builtin {
+      color: #c4b5fd;
+    }
+
+    .ok {
+      color: #22c55e;
+    }
+
+    .error {
+      color: #ef4444;
+    }
+
+    .connected {
+      color: #22c55e;
+    }
+
+    .disconnected {
+      color: #f59e0b;
+    }
+
+    @media (max-width: 1420px) {
+      .container {
+        width: 100%;
+      }
+    }
+
+    @media (max-width: 1240px) {
+      .gpu-row {
+        grid-template-columns: minmax(120px, 170px) minmax(0, 1fr);
+        grid-template-areas:
+          "id metric"
+          "meta action";
+      }
+
+      .gpu-row > .gpu-id {
+        grid-area: id;
+      }
+
+      .gpu-row > .gpu-id + div {
+        grid-area: metric;
+      }
+
+      .gpu-row > .gpu-meta {
+        grid-area: meta;
+      }
+
+      .gpu-row > .gpu-env-button {
+        grid-area: action;
+      }
+
+      .gpu-meta {
+        text-align: left;
+      }
+
+      .gpu-env-button {
+        justify-self: end;
+      }
+    }
+
+    @media (max-width: 960px) {
+      .dev_box2 {
+        width: 100%;
+      }
+
+      .resource-controls select {
+        min-width: 0;
+      }
+    }
+
+    @media (max-width: 700px) {
+      .gpu-row {
+        grid-template-columns: 1fr;
+        grid-template-areas:
+          "id"
+          "metric"
+          "meta"
+          "action";
+        gap: 8px;
+      }
+
+      .gpu-row > .gpu-id {
+        grid-area: id;
+      }
+
+      .gpu-row > .gpu-id + div {
+        grid-area: metric;
+      }
+
+      .gpu-row > .gpu-meta {
+        grid-area: meta;
+      }
+
+      .gpu-row > .gpu-env-button {
+        grid-area: action;
+      }
+
+      .gpu-id,
+      .gpu-meta {
+        text-align: left;
+      }
+
+      .gpu-env-button {
+        justify-self: start;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="top-banner">
+    <span>回到旧版：</span>
+    <a id="legacy-link" href="#" target="_blank" rel="noopener noreferrer">回到旧版</a>
+  </div>
+
+  <h1>Server Resource Monitor</h1>
+  <h2 id="current-time">Loading Current Time...</h2>
+
+  <div class="toolbar">
+    <button id="console-btn" type="button" class="active">控制台(旧版样式)</button>
+    <button id="resource-btn" type="button">资源占用</button>
+    <button id="setup-btn" type="button">自动选 GPU</button>
+  </div>
+
+  <div id="resource-controls" class="resource-controls">
+    <select id="resource-select"></select>
+  </div>
+
+  <div class="container">
+    <div class="row-container" id="row-1"></div>
+    <div class="row-container" id="row-2"></div>
+    <div class="row-container" id="row-3"></div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    function escapeHtml(text) {
+      return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function statusClass(value) {
+      return value === 'ok' ? 'ok' : 'error';
+    }
+
+    function connectionClass(value) {
+      return value === 'connected' ? 'connected' : 'disconnected';
+    }
+
+    function renderServerTitle(name, connectionStatus, shouldBlink) {
+      const lampClass = connectionStatus === 'connected' && shouldBlink
+        ? 'status-lamp flash-online'
+        : 'status-lamp';
+      const statusText = connectionStatus === 'connected' ? 'connected' : 'disconnected';
+      return `<span class="server-title">${escapeHtml(name)} <span class="${lampClass}" title="${statusText}" aria-label="${statusText}"></span></span>`;
+    }
+
+    const legacyLink = document.getElementById('legacy-link');
+    if (legacyLink) {
+      const legacyUrl = new URL(window.location.href);
+      legacyUrl.port = '2222';
+      legacyUrl.pathname = '/';
+      legacyUrl.search = '';
+      legacyUrl.hash = '';
+      legacyLink.href = legacyUrl.toString();
+    }
+
+    const RESOURCE_OPTIONS = [
+      { value: 'memory.occupancy.rate', label: '显存占用率' },
+      { value: 'utilization.gpu', label: 'GPU 利用率' },
+      { value: 'temperature.gpu', label: 'GPU 温度' },
+      { value: 'power.draw', label: 'GPU 功耗' },
+    ];
+    let currentView = 'console';
+    let currentResourceKey = 'memory.occupancy.rate';
+    let toastTimer = null;
+    const previousFirstLineByServer = new Map();
+    const previousFetchedAtByServer = new Map();
+    const terminalScrollLeftByServer = new Map();
+
+    function getFirstLine(text) {
+      const value = typeof text === 'string' ? text : '';
+      const normalized = value.replace(/\r/g, '');
+      const firstLine = normalized.split('\n')[0] || '';
+      return firstLine.trim();
+    }
+
+    function shouldBlinkOnFirstLineChange(serverName, stdoutText, connectionStatus) {
+      const key = String(serverName || '').toLowerCase();
+      const firstLine = getFirstLine(stdoutText);
+      const previous = previousFirstLineByServer.get(key);
+      previousFirstLineByServer.set(key, firstLine);
+
+      if (connectionStatus !== 'connected') {
+        return false;
+      }
+      if (previous === undefined) {
+        return false;
+      }
+      return firstLine.length > 0 && firstLine !== previous;
+    }
+
+    function shouldBlinkOnFetchedAtChange(serverName, fetchedAt, connectionStatus) {
+      const key = String(serverName || '').toLowerCase();
+      const currentFetchedAt = typeof fetchedAt === 'string' ? fetchedAt : '';
+      const previousFetchedAt = previousFetchedAtByServer.get(key);
+      previousFetchedAtByServer.set(key, currentFetchedAt);
+
+      if (connectionStatus !== 'connected') {
+        return false;
+      }
+      if (previousFetchedAt === undefined) {
+        return false;
+      }
+      return currentFetchedAt.length > 0 && currentFetchedAt !== previousFetchedAt;
+    }
+
+    function showToast(message) {
+      const toast = document.getElementById('toast');
+      toast.textContent = message;
+      toast.classList.add('visible');
+      if (toastTimer) {
+        clearTimeout(toastTimer);
+      }
+      toastTimer = setTimeout(() => {
+        toast.classList.remove('visible');
+      }, 1800);
+    }
+
+    async function copyToClipboard(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return;
+      }
+
+      const fallback = document.createElement('textarea');
+      fallback.value = text;
+      fallback.style.position = 'fixed';
+      fallback.style.left = '-9999px';
+      document.body.appendChild(fallback);
+      fallback.focus();
+      fallback.select();
+      const copied = document.execCommand('copy');
+      document.body.removeChild(fallback);
+      if (!copied) {
+        throw new Error('fallback copy failed');
+      }
+    }
+
+    function setActiveButton() {
+      document.getElementById('console-btn').classList.toggle('active', currentView === 'console');
+      document.getElementById('resource-btn').classList.toggle('active', currentView === 'resource');
+      document.getElementById('setup-btn').classList.toggle('active', currentView === 'setup');
+      document.getElementById('resource-controls').classList.toggle('visible', currentView === 'resource');
+      document.getElementById('resource-select').disabled = currentView !== 'resource';
+    }
+
+    function createConsolePanel(item) {
+      const name = item && item.server_name ? item.server_name : 'unknown';
+      const serverKey = String(name).toLowerCase();
+      const ip = item && item.ip ? item.ip : '';
+      const fetchedAt = item && item.fetched_at ? item.fetched_at : '';
+      const status = item && item.status ? item.status : 'unknown';
+      const conn = item && item.connection_status ? item.connection_status : 'unknown';
+      const exitCode = item && item.exit_code !== null && item.exit_code !== undefined ? String(item.exit_code) : 'null';
+      const outputHtml = item && item.stdout_html ? item.stdout_html : 'NULL';
+      const outputText = item && item.stdout ? item.stdout : '';
+      const blink = shouldBlinkOnFirstLineChange(name, outputText, conn);
+
+      const panel = document.createElement('div');
+      panel.className = 'dev_box2';
+      panel.innerHTML = `
+        <h2>${renderServerTitle(name, conn, blink)}</h2>
+        <div class="status-line">
+          <span class="${statusClass(status)}">status: ${escapeHtml(status)}</span>
+          <span class="${connectionClass(conn)}">connection: ${escapeHtml(conn)}</span>
+          <span>exit: ${escapeHtml(exitCode)}</span>
+          <span>${escapeHtml(ip)}</span>
+          <span>${escapeHtml(fetchedAt)}</span>
+        </div>
+        <div class="terminal" data-server-key="${escapeHtml(serverKey)}">
+          <pre class="output">${outputHtml}</pre>
+        </div>
+      `;
+      return panel;
+    }
+
+    function getResourceStats(item) {
+      const data = item && item.json_data ? item.json_data : null;
+      const gpus = data && Array.isArray(data.gpus) ? data.gpus : [];
+
+      let used = 0;
+      let total = 0;
+      for (const gpu of gpus) {
+        used += Number(gpu['memory.used'] || 0);
+        total += Number(gpu['memory.total'] || 0);
+      }
+
+      return { used, total, gpus };
+    }
+
+    function getGpuMetricValue(gpu, resourceKey) {
+      if (resourceKey === 'memory.occupancy.rate') {
+        const used = Number(gpu ? gpu['memory.used'] || 0 : 0);
+        const total = Number(gpu ? gpu['memory.total'] || 0 : 0);
+        if (!total) {
+          return Number.POSITIVE_INFINITY;
+        }
+        return (used / total) * 100;
+      }
+
+      const rawValue = gpu ? gpu[resourceKey] : null;
+      if (rawValue === null || rawValue === undefined || rawValue === '') {
+        return Number.POSITIVE_INFINITY;
+      }
+      const numericValue = Number(rawValue);
+      if (Number.isNaN(numericValue)) {
+        return Number.POSITIVE_INFINITY;
+      }
+      return numericValue;
+    }
+
+    function formatGpuMetricValue(gpu, resourceKey) {
+      if (resourceKey === 'memory.occupancy.rate') {
+        const used = Number(gpu ? gpu['memory.used'] || 0 : 0);
+        const total = Number(gpu ? gpu['memory.total'] || 0 : 0);
+        if (!total) {
+          return 'N/A';
+        }
+        return `${((used / total) * 100).toFixed(1)}%`;
+      }
+
+      const rawValue = gpu ? gpu[resourceKey] : null;
+      if (rawValue === null || rawValue === undefined || rawValue === '') {
+        return 'N/A';
+      }
+      return String(rawValue);
+    }
+
+    function updateResourceSelector(items) {
+      const selector = document.getElementById('resource-select');
+      const previousValue = selector.value || currentResourceKey;
+      selector.innerHTML = '';
+      for (const optionData of RESOURCE_OPTIONS) {
+        const option = document.createElement('option');
+        option.value = optionData.value;
+        option.textContent = optionData.label;
+        selector.appendChild(option);
+      }
+
+      const validValues = RESOURCE_OPTIONS.map((optionData) => optionData.value);
+      if (validValues.includes(previousValue)) {
+        selector.value = previousValue;
+      } else if (validValues.includes(currentResourceKey)) {
+        selector.value = currentResourceKey;
+      } else {
+        selector.value = RESOURCE_OPTIONS[0].value;
+      }
+
+      currentResourceKey = selector.value;
+    }
+
+    function createResourcePanel(item, resourceKey) {
+      const name = item && item.server_name ? item.server_name : 'unknown';
+      const ip = item && item.ip ? item.ip : '';
+      const fetchedAt = item && item.fetched_at ? item.fetched_at : '';
+      const status = item && item.status ? item.status : 'unknown';
+      const conn = item && item.connection_status ? item.connection_status : 'unknown';
+      const stats = getResourceStats(item);
+      const blink = shouldBlinkOnFetchedAtChange(name, fetchedAt, conn);
+
+      const sortedGpus = [...stats.gpus].sort((left, right) => getGpuMetricValue(left, resourceKey) - getGpuMetricValue(right, resourceKey));
+
+      const numericValues = sortedGpus
+        .map((gpu) => getGpuMetricValue(gpu, resourceKey))
+        .filter((value) => Number.isFinite(value));
+      const maxMetricValue = numericValues.length > 0 ? Math.max(...numericValues) : 0;
+      const fullScaleResources = new Set(['memory.occupancy.rate', 'utilization.gpu']);
+
+      const gpuRowsHtml = sortedGpus.map((gpu, index) => {
+        const gpuIndex = gpu.index !== undefined ? gpu.index : '?';
+        const gpuName = gpu.name || 'GPU';
+        const metricValue = getGpuMetricValue(gpu, resourceKey);
+        const metricText = formatGpuMetricValue(gpu, resourceKey);
+        const fillWidth = Number.isFinite(metricValue)
+          ? (fullScaleResources.has(resourceKey)
+            ? Math.max(0, Math.min(100, metricValue))
+            : (maxMetricValue > 0 ? Math.max(0, Math.min(100, (metricValue / maxMetricValue) * 100)) : 0))
+          : 0;
+        const progressLabel = Number.isFinite(metricValue) ? metricValue.toFixed(1) : 'N/A';
+        const metricLabel = RESOURCE_OPTIONS.find((optionData) => optionData.value === resourceKey)?.label || resourceKey;
+        const envCommand = `export CUDA_VISIBLE_DEVICES=${gpuIndex}`;
+        return `
+          <div class="gpu-row">
+            <div class="gpu-id">GPU ${escapeHtml(String(gpuIndex))}<div class="gpu-subid">${escapeHtml(gpuName)}</div></div>
+            <div>
+              <div class="gpu-name">${escapeHtml(metricLabel)} 排序值</div>
+              <div class="gpu-progress"><div class="gpu-progress-fill" style="width:${fillWidth}%;"></div></div>
+              <div class="gpu-value-badge">${escapeHtml(metricLabel)}: ${escapeHtml(metricText)}</div>
+            </div>
+            <div class="gpu-meta">${escapeHtml(metricText)}<br>${escapeHtml(progressLabel)}</div>
+            <button class="gpu-env-button" type="button" title="复制并设置 CUDA_VISIBLE_DEVICES：${escapeHtml(envCommand)}" data-env="${escapeHtml(envCommand)}">
+              <span class="gpu-env-main">CUDA_VISIBLE_DEVICES</span>
+              <span class="gpu-env-sub">点击复制</span>
+            </button>
+          </div>
+        `;
+      }).join('');
+
+      const panel = document.createElement('div');
+      panel.className = 'dev_box2';
+      panel.innerHTML = `
+        <h2>${renderServerTitle(name, conn, blink)}</h2>
+        <div class="resource-summary">
+          <span class="${statusClass(status)}">status: ${escapeHtml(status)}</span>
+          <span class="${connectionClass(conn)}">connection: ${escapeHtml(conn)}</span>
+          <span>排序指标: ${escapeHtml(resourceKey)}</span>
+          <span>GPU 数: ${escapeHtml(String(stats.gpus.length))}</span>
+          <span>${escapeHtml(ip)}</span>
+          <span>${escapeHtml(fetchedAt)}</span>
+        </div>
+        <div class="memory-card">
+          <div class="resource-card-title">
+            <span>GPU 资源表</span>
+            <span class="resource-card-subtitle">按 ${escapeHtml(RESOURCE_OPTIONS.find((optionData) => optionData.value === resourceKey)?.label || resourceKey)} 升序排列</span>
+          </div>
+          <div class="gpu-table">
+            ${gpuRowsHtml || '<div class="gpu-row"><div class="gpu-id">GPU ?<div class="gpu-subid">NULL</div></div><div><div class="gpu-name">N/A</div><div class="gpu-progress"><div class="gpu-progress-fill" style="width:0%;"></div></div></div><div class="gpu-meta">N/A<br>N/A</div></div>'}
+          </div>
+        </div>
+      `;
+      return panel;
+    }
+
+    function buildNameMap(items) {
+      const map = new Map();
+      for (const item of items) {
+        const key = String(item.server_name || '').toLowerCase();
+        map.set(key, item);
+      }
+      return map;
+    }
+
+    function renderRows(panels) {
+      const row1 = document.getElementById('row-1');
+      const row2 = document.getElementById('row-2');
+      const row3 = document.getElementById('row-3');
+      row1.innerHTML = '';
+      row2.innerHTML = '';
+      row3.innerHTML = '';
+
+      const rows = [row1, row2, row3];
+      let rowIndex = 0;
+      let countInRow = 0;
+      for (const panel of panels) {
+        rows[rowIndex].appendChild(panel);
+        countInRow += 1;
+        if (countInRow >= 2) {
+          rowIndex = Math.min(rowIndex + 1, rows.length - 1);
+          countInRow = 0;
+        }
+      }
+    }
+
+    function highlightPython(code) {
+      const tokenPattern = /("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|#.*|\b(?:False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)\b|\b(?:exec|print|len|range|str|int|float|dict|list|set|tuple|open|__import__)\b|\b\d+(?:\.\d+)?\b)/g;
+      let highlighted = '';
+      let lastIndex = 0;
+      for (const match of code.matchAll(tokenPattern)) {
+        const token = match[0];
+        highlighted += escapeHtml(code.slice(lastIndex, match.index));
+        const escapedToken = escapeHtml(token);
+        if (token.startsWith('#')) {
+          highlighted += `<span class="syntax-comment">${escapedToken}</span>`;
+        } else if (token.startsWith('"') || token.startsWith("'")) {
+          highlighted += `<span class="syntax-string">${escapedToken}</span>`;
+        } else if (/^\d/.test(token)) {
+          highlighted += `<span class="syntax-number">${escapedToken}</span>`;
+        } else if (/^(exec|print|len|range|str|int|float|dict|list|set|tuple|open|__import__)$/.test(token)) {
+          highlighted += `<span class="syntax-builtin">${escapedToken}</span>`;
+        } else {
+          highlighted += `<span class="syntax-keyword">${escapedToken}</span>`;
+        }
+        lastIndex = match.index + token.length;
+      }
+      highlighted += escapeHtml(code.slice(lastIndex));
+      return highlighted;
+    }
+
+    function createCodeBlock(title, code) {
+      const panel = document.createElement('div');
+      panel.className = 'code-block-card';
+      panel.dataset.rawCode = code;
+      panel.innerHTML = `
+        <div class="code-block-header">
+          <div class="code-block-title">${escapeHtml(title)}</div>
+          <button class="code-copy-button" type="button">复制</button>
+        </div>
+        <pre class="pretty-code"><code>${highlightPython(code)}</code></pre>
+      `;
+      return panel;
+    }
+
+    async function renderSetupView() {
+      let onelineCode = 'Loading...';
+      let exampleCode = 'Loading...';
+      try {
+        const response = await fetch('/auto_set_gpu_oneline');
+        onelineCode = await response.text();
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: 请重启后端以加载 /auto_set_gpu_oneline 路由`);
+        }
+      } catch (error) {
+        onelineCode = `Failed to load assets/auto_set_gpu_oneline.py\n${String(error)}`;
+      }
+
+      try {
+        const response = await fetch('/auto_set_gpu_example');
+        exampleCode = await response.text();
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: 请重启后端以加载 /auto_set_gpu_example 路由`);
+        }
+      } catch (error) {
+        exampleCode = `Failed to load assets/auto_set_gpu_example.py\n${String(error)}`;
+      }
+
+      const wrapper = document.createElement('div');
+      wrapper.className = 'code-guide-panel';
+      wrapper.innerHTML = '<div class="code-guide-grid"></div>';
+      const grid = wrapper.querySelector('.code-guide-grid');
+      grid.appendChild(createCodeBlock('assets/auto_set_gpu_oneline.py', onelineCode));
+      grid.appendChild(createCodeBlock('assets/auto_set_gpu_example.py', exampleCode));
+      renderRows([wrapper]);
+    }
+
+    function renderConsoleView(items) {
+      const terminalsBeforeRender = document.querySelectorAll('.terminal[data-server-key]');
+      for (const terminal of terminalsBeforeRender) {
+        const key = terminal.getAttribute('data-server-key') || '';
+        if (key) {
+          terminalScrollLeftByServer.set(key, terminal.scrollLeft);
+        }
+      }
+
+      const byName = buildNameMap(items);
+      const layout = [
+        ['server15', 'server16'],
+        ['server30', 'server97'],
+        ['server247'],
+      ];
+
+      const panels = [];
+      for (const row of layout) {
+        for (const serverName of row) {
+          const item = byName.get(serverName) || { server_name: serverName, stdout_html: 'NULL' };
+          panels.push(createConsolePanel(item));
+        }
+      }
+      renderRows(panels);
+
+      const terminalsAfterRender = document.querySelectorAll('.terminal[data-server-key]');
+      for (const terminal of terminalsAfterRender) {
+        const key = terminal.getAttribute('data-server-key') || '';
+        if (!key) {
+          continue;
+        }
+        const savedScrollLeft = terminalScrollLeftByServer.get(key);
+        if (savedScrollLeft !== undefined) {
+          terminal.scrollLeft = savedScrollLeft;
+        }
+      }
+    }
+
+    function renderResourceView(items) {
+      updateResourceSelector(items);
+      const resourceKey = document.getElementById('resource-select').value || currentResourceKey;
+      const byName = buildNameMap(items);
+      const layout = [
+        ['server15', 'server16'],
+        ['server30', 'server97'],
+        ['server247'],
+      ];
+
+      const panels = [];
+      for (const row of layout) {
+        for (const serverName of row) {
+          const item = byName.get(serverName) || { server_name: serverName, json_data: { gpus: [] } };
+          panels.push(createResourcePanel(item, resourceKey));
+        }
+      }
+      renderRows(panels);
+    }
+
+    async function refresh() {
+      document.getElementById('current-time').textContent = new Date().toLocaleString();
+
+      if (currentView === 'setup') {
+        await renderSetupView();
+        setActiveButton();
+        return;
+      }
+
+      const endpoint = currentView === 'resource' ? '/jinfo' : '/info';
+      const response = await fetch(endpoint);
+      const payload = await response.json();
+
+      const items = payload.data || [];
+      if (currentView === 'resource') {
+        renderResourceView(items);
+      } else {
+        renderConsoleView(items);
+      }
+
+      setActiveButton();
+    }
+
+    document.getElementById('console-btn').addEventListener('click', () => {
+      currentView = 'console';
+      refresh();
+    });
+
+    document.getElementById('resource-btn').addEventListener('click', () => {
+      currentView = 'resource';
+      refresh();
+    });
+
+    document.getElementById('setup-btn').addEventListener('click', () => {
+      currentView = 'setup';
+      refresh();
+    });
+
+    document.getElementById('resource-select').addEventListener('change', () => {
+      currentResourceKey = document.getElementById('resource-select').value;
+      if (currentView === 'resource') {
+        refresh();
+      }
+    });
+
+    document.addEventListener('click', async (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+
+      const codeButton = target.closest('.code-copy-button');
+      if (codeButton instanceof HTMLElement) {
+        const codeCard = codeButton.closest('.code-block-card');
+        const code = codeCard instanceof HTMLElement ? codeCard.dataset.rawCode || '' : '';
+        if (!code) {
+          showToast('复制失败：未找到代码');
+          return;
+        }
+
+        try {
+          await copyToClipboard(code);
+          showToast('已复制代码');
+        } catch (error) {
+          showToast('复制失败，请手动复制');
+        }
+        return;
+      }
+
+      const button = target.closest('.gpu-env-button');
+      if (!(button instanceof HTMLElement)) {
+        return;
+      }
+
+      const command = button.getAttribute('data-env') || '';
+      if (!command) {
+        showToast('复制失败：未找到命令');
+        return;
+      }
+
+      try {
+        await copyToClipboard(command);
+        showToast(`已复制到粘贴板：${command}`);
+      } catch (error) {
+        showToast('复制失败，请手动复制');
+      }
+    });
+
+    refresh();
+    setInterval(() => {
+      if (currentView !== 'setup') {
+        refresh();
+      }
+    }, 2000);
+  </script>
+</body>
+</html>
