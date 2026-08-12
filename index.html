@@ -217,6 +217,85 @@
       transform: translate(-50%, -50%) scale(1);
     }
 
+    .page-footer {
+      padding: 10px 12px 20px;
+      text-align: center;
+    }
+
+    .changelog-button,
+    .changelog-close {
+      border: 1px solid #999999;
+      border-radius: 6px;
+      background: #f5f5f5;
+      color: #111111;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    .changelog-button {
+      padding: 6px 14px;
+    }
+
+    .changelog-button:hover,
+    .changelog-close:hover {
+      background: #e5e5e5;
+    }
+
+    .changelog-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 1001;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      box-sizing: border-box;
+      background: rgba(0, 0, 0, 0.5);
+    }
+
+    .changelog-modal.visible {
+      display: flex;
+    }
+
+    .changelog-dialog {
+      width: min(680px, 100%);
+      max-height: min(76vh, 680px);
+      display: flex;
+      flex-direction: column;
+      border: 1px solid #777777;
+      border-radius: 10px;
+      background: #ffffff;
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
+      overflow: hidden;
+    }
+
+    .changelog-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid #dddddd;
+    }
+
+    .changelog-header h2 {
+      margin: 0;
+      font-size: 18px;
+    }
+
+    .changelog-close {
+      padding: 4px 10px;
+    }
+
+    .changelog-content {
+      margin: 0;
+      padding: 14px;
+      overflow: auto;
+      white-space: pre-wrap;
+      line-height: 1.55;
+      text-align: left;
+    }
+
     .resource-controls {
       display: none;
       width: 100%;
@@ -763,7 +842,20 @@
     <div class="row-container" id="row-3"></div>
   </div>
 
+  <footer class="page-footer">
+    <button id="changelog-btn" class="changelog-button" type="button">更新记录</button>
+  </footer>
+
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="changelog-modal" class="changelog-modal" role="dialog" aria-modal="true" aria-labelledby="changelog-title" aria-hidden="true">
+    <div class="changelog-dialog">
+      <div class="changelog-header">
+        <h2 id="changelog-title">更新记录</h2>
+        <button id="changelog-close" class="changelog-close" type="button" aria-label="关闭更新记录">关闭</button>
+      </div>
+      <pre id="changelog-content" class="changelog-content">Loading...</pre>
+    </div>
+  </div>
 
   <script>
     function escapeHtml(text) {
@@ -861,6 +953,31 @@
       toastTimer = setTimeout(() => {
         toast.classList.remove('visible');
       }, 1800);
+    }
+
+    async function openChangelog() {
+      const modal = document.getElementById('changelog-modal');
+      const content = document.getElementById('changelog-content');
+      modal.classList.add('visible');
+      modal.setAttribute('aria-hidden', 'false');
+      content.textContent = 'Loading...';
+
+      try {
+        const response = await fetch('/changelog');
+        const text = await response.text();
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        content.textContent = text;
+      } catch (error) {
+        content.textContent = `加载更新记录失败：${String(error)}`;
+      }
+    }
+
+    function closeChangelog() {
+      const modal = document.getElementById('changelog-modal');
+      modal.classList.remove('visible');
+      modal.setAttribute('aria-hidden', 'true');
     }
 
     async function copyToClipboard(text) {
@@ -1269,6 +1386,19 @@
       currentResourceKey = document.getElementById('resource-select').value;
       if (currentView === 'resource') {
         refresh();
+      }
+    });
+
+    document.getElementById('changelog-btn').addEventListener('click', openChangelog);
+    document.getElementById('changelog-close').addEventListener('click', closeChangelog);
+    document.getElementById('changelog-modal').addEventListener('click', (event) => {
+      if (event.target === event.currentTarget) {
+        closeChangelog();
+      }
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        closeChangelog();
       }
     });
 

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import sqlite3
 import threading
 import fcntl
@@ -16,6 +17,7 @@ from flask import Flask, Response, jsonify, request
 
 BASE_DIR = Path(__file__).resolve().parent
 SERVERS_FILE = BASE_DIR / "servers.json"
+CHANGELOG_FILE = BASE_DIR / "CHANGELOG.md"
 SSH_KEY_FILE = BASE_DIR / "id_rsa_guangxing"
 DB_FILE = BASE_DIR / "server_monitor.sqlite3"
 COLLECTOR_LOCK_FILE = BASE_DIR / "collector.lock"
@@ -45,6 +47,10 @@ CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]")
 BLACK_FOREGROUND_RE = re.compile(r"color\s*:\s*(?:#000(?:000)?|black)\s*;?", re.IGNORECASE)
 ANSI_CLEAR_RE = re.compile(r"\x1b\[[0-9;?]*[HfJ]")
 WATCH_FRAME_SPLIT_RE = re.compile(r"\x1b\[[0-9;?]*2J\x1b\[[0-9;?]*H|\x1b\[[0-9;?]*H\x1b\[[0-9;?]*J")
+# DCS sequences such as XTGETTCAP are terminal capability queries, not gpustat output.
+# Remove the complete sequence before stripping individual ESC controls so its payload
+# (for example, "+q544e...") cannot leak into the rendered terminal text.
+ANSI_DCS_RE = re.compile(r"\x1bP.*?(?:\x1b\\|\x9c)", re.DOTALL)
 ANSI_NON_SGR_RE = re.compile(r"\x1b\[(?![0-9;]*m)[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
 ANSI_DEC_CURSOR_RE = re.compile(r"\x1b[78]")
 GPUSTAT_HEADER_RE = re.compile(
@@ -179,7 +185,8 @@ def ansi_to_html_fragment(text: str) -> str:
 def normalize_stream_text(stream_text: str) -> str:
     # Keep only latest gpustat snapshot: remove cursor controls, then cut from the last header line.
     tail = stream_text[-120000:]
-    cleaned = ANSI_CLEAR_RE.sub("", tail)
+    cleaned = ANSI_DCS_RE.sub("", tail)
+    cleaned = ANSI_CLEAR_RE.sub("", cleaned)
     cleaned = ANSI_NON_SGR_RE.sub("", cleaned)
     cleaned = ANSI_DEC_CURSOR_RE.sub("", cleaned)
     cleaned = cleaned.replace("\r", "")
@@ -226,6 +233,25 @@ def connect_ssh_client(server: dict) -> paramiko.SSHClient:
     return client
 
 
+def command_with_server_env(server: dict, command: str) -> str:
+    """Prefix a remote command with the environment configured for one server."""
+    environment = server.get("env", {})
+    if environment is None:
+        environment = {}
+    if not isinstance(environment, dict):
+        raise ValueError("server env must be an object")
+
+    assignments = []
+    for name, value in environment.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError(f"invalid environment variable name: {name!r}")
+        if value is None:
+            raise ValueError(f"environment variable {name} must not be null")
+        assignments.append(f"{name}={shlex.quote(str(value))}")
+
+    return " ".join([*assignments, command])
+
+
 def maybe_prune(conn: sqlite3.Connection, fetched_at: str) -> None:
     global last_prune_at_epoch
     now_epoch = datetime.now(timezone.utc).timestamp()
@@ -239,6 +265,8 @@ def maybe_prune(conn: sqlite3.Connection, fetched_at: str) -> None:
 
 def save_poll_result(
     server: dict,
+    command: str,
+    json_command: str,
     stdout: str,
     stderr: str,
     exit_code: int | None,
@@ -263,7 +291,7 @@ def save_poll_result(
                     server.get("name", "unknown"),
                     server.get("ip", ""),
                     server.get("username", ""),
-                    COMMAND,
+                    command,
                     stdout,
                     stdout_html,
                     stderr,
@@ -283,7 +311,7 @@ def save_poll_result(
                     server.get("name", "unknown"),
                     server.get("ip", ""),
                     server.get("username", ""),
-                    COMMAND_JSON,
+                    json_command,
                     json_stdout,
                     json_exit_code,
                     json_status,
@@ -358,13 +386,15 @@ def load_server_name_to_ip_map() -> dict[str, str]:
     return mapping
 
 
-def start_watch_streams(client: paramiko.SSHClient):
-    _, text_stdout, text_stderr = client.exec_command(COMMAND, get_pty=True)
+def start_watch_streams(client: paramiko.SSHClient, command: str):
+    _, text_stdout, text_stderr = client.exec_command(command, get_pty=True)
     return text_stdout, text_stderr
 
 
 
 def poll_server_forever(server: dict) -> None:
+    watch_command = command_with_server_env(server, COMMAND)
+    json_command = command_with_server_env(server, COMMAND_JSON)
     client = None
     text_stdout = None
     text_stderr = None
@@ -383,7 +413,7 @@ def poll_server_forever(server: dict) -> None:
             if client is None or transport is None or not transport.is_active():
                 client = connect_ssh_client(server)
 
-                text_stdout, text_stderr = start_watch_streams(client)
+                text_stdout, text_stderr = start_watch_streams(client, watch_command)
                 text_stream = ""
                 text_stderr_stream = ""
                 latest_json_text = ""
@@ -408,7 +438,7 @@ def poll_server_forever(server: dict) -> None:
             now = time.monotonic()
             if now - last_json_polled_at >= POLL_INTERVAL_SECONDS:
                 try:
-                    _, json_stdout, json_stderr = client.exec_command(COMMAND_JSON, get_pty=False)
+                    _, json_stdout, json_stderr = client.exec_command(json_command, get_pty=False)
                     latest_json_exit_code = json_stdout.channel.recv_exit_status()
                     latest_json_text = json_stdout.read().decode("utf-8", errors="ignore").strip()
                     json_err = json_stderr.read().decode("utf-8", errors="ignore").strip()
@@ -432,6 +462,8 @@ def poll_server_forever(server: dict) -> None:
 
                 save_poll_result(
                     server=server,
+                    command=watch_command,
+                    json_command=json_command,
                     stdout=normalized_text,
                     stderr=text_stderr_stream,
                     exit_code=0 if status == "ok" else None,
@@ -451,6 +483,8 @@ def poll_server_forever(server: dict) -> None:
             fetched_at = utc_now_iso()
             save_poll_result(
                 server=server,
+                command=watch_command,
+                json_command=json_command,
                 stdout="",
                 stderr="",
                 exit_code=None,
@@ -540,6 +574,16 @@ def health() -> Response:
         "interval_seconds": POLL_INTERVAL_SECONDS,
         "db_exists": DB_FILE.exists(),
     })
+
+
+@app.route("/changelog", methods=["GET"])
+def changelog() -> Response:
+    try:
+        content = CHANGELOG_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return Response("CHANGELOG.md not found", status=404, mimetype="text/plain")
+
+    return Response(content, mimetype="text/markdown")
 
 
 @app.route("/jinfo", methods=["GET"])
