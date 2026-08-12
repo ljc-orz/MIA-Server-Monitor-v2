@@ -77,6 +77,11 @@
       animation: lampFlashOnline 1s cubic-bezier(0.2, 0.7, 0.2, 1) 1;
     }
 
+    .status-lamp.offline {
+      background: #ef4444;
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12), 0 0 7px rgba(239, 68, 68, 0.75), inset 0 0 4px rgba(0, 0, 0, 0.25);
+    }
+
     @keyframes lampFlashOnline {
       0% {
         transform: scale(0.9);
@@ -876,11 +881,17 @@
     }
 
     function renderServerTitle(name, connectionStatus, shouldBlink) {
-      const lampClass = connectionStatus === 'connected' && shouldBlink
-        ? 'status-lamp flash-online'
-        : 'status-lamp';
+      const lampClass = connectionStatus === 'disconnected'
+        ? 'status-lamp offline'
+        : (connectionStatus === 'connected' && shouldBlink ? 'status-lamp flash-online' : 'status-lamp');
       const statusText = connectionStatus === 'connected' ? 'connected' : 'disconnected';
       return `<span class="server-title">${escapeHtml(name)} <span class="${lampClass}" title="${statusText}" aria-label="${statusText}"></span></span>`;
+    }
+
+    function displayFetchedAt(item) {
+      const fetchedAt = item && item.fetched_at ? item.fetched_at : '';
+      const lastSuccessAt = item && item.last_success_at ? item.last_success_at : '';
+      return item && item.connection_status === 'disconnected' && lastSuccessAt ? lastSuccessAt : fetchedAt;
     }
 
     const legacyLink = document.getElementById('legacy-link');
@@ -1012,7 +1023,7 @@
       const name = item && item.server_name ? item.server_name : 'unknown';
       const serverKey = String(name).toLowerCase();
       const ip = item && item.ip ? item.ip : '';
-      const fetchedAt = item && item.fetched_at ? item.fetched_at : '';
+      const fetchedAt = displayFetchedAt(item);
       const status = item && item.status ? item.status : 'unknown';
       const conn = item && item.connection_status ? item.connection_status : 'unknown';
       const exitCode = item && item.exit_code !== null && item.exit_code !== undefined ? String(item.exit_code) : 'null';
@@ -1116,7 +1127,7 @@
     function createResourcePanel(item, resourceKey) {
       const name = item && item.server_name ? item.server_name : 'unknown';
       const ip = item && item.ip ? item.ip : '';
-      const fetchedAt = item && item.fetched_at ? item.fetched_at : '';
+      const fetchedAt = displayFetchedAt(item);
       const status = item && item.status ? item.status : 'unknown';
       const conn = item && item.connection_status ? item.connection_status : 'unknown';
       const stats = getResourceStats(item);

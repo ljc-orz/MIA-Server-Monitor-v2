@@ -101,6 +101,7 @@ def init_db() -> None:
                 exit_code INTEGER,
                 status TEXT NOT NULL,
                 connection_status TEXT NOT NULL DEFAULT 'unknown',
+                last_success_at TEXT NOT NULL DEFAULT '',
                 fetched_at TEXT NOT NULL
             )
             """
@@ -110,6 +111,15 @@ def init_db() -> None:
             conn.execute("ALTER TABLE server_readings ADD COLUMN connection_status TEXT NOT NULL DEFAULT 'unknown'")
         if "stdout_html" not in existing_columns:
             conn.execute("ALTER TABLE server_readings ADD COLUMN stdout_html TEXT NOT NULL DEFAULT ''")
+        if "last_success_at" not in existing_columns:
+            conn.execute("ALTER TABLE server_readings ADD COLUMN last_success_at TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                """
+                UPDATE server_readings
+                SET last_success_at = fetched_at
+                WHERE status = 'ok' AND connection_status = 'connected'
+                """
+            )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_server_readings_fetched_at
@@ -135,6 +145,7 @@ def init_db() -> None:
                 exit_code INTEGER,
                 status TEXT NOT NULL,
                 connection_status TEXT NOT NULL DEFAULT 'unknown',
+                last_success_at TEXT NOT NULL DEFAULT '',
                 fetched_at TEXT NOT NULL
             )
             """
@@ -142,6 +153,15 @@ def init_db() -> None:
         existing_json_columns = {row[1] for row in conn.execute("PRAGMA table_info(server_json_readings)").fetchall()}
         if "connection_status" not in existing_json_columns:
             conn.execute("ALTER TABLE server_json_readings ADD COLUMN connection_status TEXT NOT NULL DEFAULT 'unknown'")
+        if "last_success_at" not in existing_json_columns:
+            conn.execute("ALTER TABLE server_json_readings ADD COLUMN last_success_at TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                """
+                UPDATE server_json_readings
+                SET last_success_at = fetched_at
+                WHERE status = 'ok' AND connection_status = 'connected'
+                """
+            )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_server_json_readings_fetched_at
@@ -273,9 +293,11 @@ def save_poll_result(
     status: str,
     connection_status: str,
     fetched_at: str,
+    last_success_at: str | None,
     json_stdout: str,
     json_exit_code: int | None,
     json_status: str,
+    json_last_success_at: str | None,
 ) -> None:
     stdout_html = ansi_to_html_fragment(stdout)
 
@@ -284,8 +306,8 @@ def save_poll_result(
             conn.execute(
                 """
                 INSERT INTO server_readings
-                (server_name, ip, username, command, stdout, stdout_html, stderr, exit_code, status, connection_status, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (server_name, ip, username, command, stdout, stdout_html, stderr, exit_code, status, connection_status, last_success_at, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     server.get("name", "unknown"),
@@ -298,14 +320,15 @@ def save_poll_result(
                     exit_code,
                     status,
                     connection_status,
+                    last_success_at or "",
                     fetched_at,
                 ),
             )
             conn.execute(
                 """
                 INSERT INTO server_json_readings
-                (server_name, ip, username, command, stdout_json, exit_code, status, connection_status, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (server_name, ip, username, command, stdout_json, exit_code, status, connection_status, last_success_at, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     server.get("name", "unknown"),
@@ -316,6 +339,7 @@ def save_poll_result(
                     json_exit_code,
                     json_status,
                     connection_status,
+                    json_last_success_at or "",
                     fetched_at,
                 ),
             )
@@ -328,7 +352,7 @@ def fetch_latest_readings() -> list[dict]:
         rows = conn.execute(
             """
             SELECT sr.server_name, sr.ip, sr.username, sr.command, sr.stdout, sr.stderr,
-                     sr.stdout_html, sr.exit_code, sr.status, sr.connection_status, sr.fetched_at
+                     sr.stdout_html, sr.exit_code, sr.status, sr.connection_status, sr.last_success_at, sr.fetched_at
             FROM server_readings sr
             JOIN (
                 SELECT ip, MAX(id) AS max_id
@@ -347,7 +371,7 @@ def fetch_latest_json_readings() -> list[dict]:
         rows = conn.execute(
             """
             SELECT sr.server_name, sr.ip, sr.username, sr.command, sr.stdout_json,
-                   sr.exit_code, sr.status, sr.connection_status, sr.fetched_at
+                   sr.exit_code, sr.status, sr.connection_status, sr.last_success_at, sr.fetched_at
             FROM server_json_readings sr
             JOIN (
                 SELECT ip, MAX(id) AS max_id
@@ -373,6 +397,24 @@ def fetch_latest_json_readings() -> list[dict]:
         results.append(item)
 
     return results
+
+
+def fetch_last_success_at(table_name: str, ip: str) -> str | None:
+    if table_name not in {"server_readings", "server_json_readings"}:
+        raise ValueError(f"unsupported table: {table_name}")
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            f"""
+            SELECT last_success_at
+            FROM {table_name}
+            WHERE ip = ? AND last_success_at != ''
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (ip,),
+        ).fetchone()
+    return row["last_success_at"] if row is not None else None
 
 
 def load_server_name_to_ip_map() -> dict[str, str]:
@@ -406,6 +448,8 @@ def poll_server_forever(server: dict) -> None:
     last_json_polled_at = 0.0
     save_interval = max(0.3, POLL_INTERVAL_SECONDS * 0.5)
     last_saved_at = 0.0
+    last_success_at = fetch_last_success_at("server_readings", server.get("ip", ""))
+    last_json_success_at = fetch_last_success_at("server_json_readings", server.get("ip", ""))
 
     while not stop_event.is_set():
         try:
@@ -459,6 +503,10 @@ def poll_server_forever(server: dict) -> None:
 
                 normalized_text = normalize_stream_text(text_stream)
                 status = "ok" if normalized_text else "error"
+                if status == "ok" and connection_status == "connected":
+                    last_success_at = fetched_at
+                if latest_json_status == "ok" and connection_status == "connected":
+                    last_json_success_at = fetched_at
 
                 save_poll_result(
                     server=server,
@@ -470,9 +518,11 @@ def poll_server_forever(server: dict) -> None:
                     status=status,
                     connection_status=connection_status,
                     fetched_at=fetched_at,
+                    last_success_at=last_success_at,
                     json_stdout=latest_json_text,
                     json_exit_code=latest_json_exit_code,
                     json_status=latest_json_status,
+                    json_last_success_at=last_json_success_at,
                 )
                 last_saved_at = now
 
@@ -491,9 +541,11 @@ def poll_server_forever(server: dict) -> None:
                 status="error",
                 connection_status="disconnected",
                 fetched_at=fetched_at,
+                last_success_at=last_success_at,
                 json_stdout="",
                 json_exit_code=None,
                 json_status="error",
+                json_last_success_at=last_json_success_at,
             )
             if client is not None:
                 client.close()
