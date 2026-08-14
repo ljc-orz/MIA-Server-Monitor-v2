@@ -1,0 +1,29 @@
+[Unit]
+Description=GPU Monitor Server Gunicorn
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# 替换成你的运行用户名，如需新建专用用户就填cfuser
+User=XXX
+Group=XXX_G
+Type=simple
+# 先切换工作目录，再执行gunicorn
+WorkingDirectory=YYY
+ExecStart=/.../anaconda3/envs/.../bin/gunicorn -w 1 -b 0.0.0.0:2223 main:app
+
+# 进程异常自动重启配置
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+
+# 安全限制
+NoNewPrivileges=true
+PrivateTmp=true
+
+# 输出日志到systemd日志
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
