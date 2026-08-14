@@ -97,12 +97,14 @@ ssh-copy-id -i ./monitor_key.pub monitor@example-host
 
 字段说明：
 
-- `name`：页面和自动选卡接口中使用的稳定名称。名称修改后，如前端仍使用固定布局，需要同步调整 `index.html`。
+- `name`：页面和自动选卡接口中使用的稳定名称。服务器按 `servers.json` 中的顺序展示。
 - `ip`：可由部署机访问的 SSH 地址。
 - `username`：远程 SSH 用户。
 - `env`：可选对象。每个键值对会安全地前缀到该服务器的两条 `gpustat` 命令。变量名必须符合 shell 环境变量命名规则，值会转为字符串并进行 shell 转义。
 
 `192.0.2.0/24` 是文档保留地址，仅用于示例；请勿将真实网络信息写入 README 或提交到版本库。
+
+保存 `servers.json` 后无需重启服务：采集端默认会在 2 秒内启动新增服务器的采集、停止已删除服务器的采集，或在 IP、账号、环境变量变化时替换对应采集线程。网页也会在下一次刷新时按文件中的当前顺序展示服务器。配置无效时，服务会保留上一份可用的采集配置，并在 systemd 日志中记录错误。
 
 ## 使用 systemd 部署
 
@@ -125,6 +127,7 @@ Environment="POLL_INTERVAL_SECONDS=2"
 Environment="SSH_TIMEOUT_SECONDS=10"
 Environment="RETENTION_MINUTES=10"
 Environment="PRUNE_INTERVAL_SECONDS=60"
+Environment="SERVER_CONFIG_REFRESH_SECONDS=2"
 ```
 
 安装并启动：
@@ -177,7 +180,7 @@ sudo journalctl -u gpu-monitor.service -n 200 --no-pager
 2. 每台服务器由 `poll_server_forever()` 维护一个 SSH 连接。它一边读取 watch 输出，一边周期性读取 JSON 输出。
 3. `normalize_stream_text()` 负责清理终端控制序列。修改该部分时必须保留 SGR 颜色序列，并防止 DCS 等控制序列残留到页面。
 4. 前端没有打包工具。修改 `index.html` 后应直接检查 HTML、CSS 和浏览器控制台错误。
-5. 前端的服务器排列目前由页面中的固定布局数组决定；新增、删除或改名服务器时要同步检查这部分逻辑。
+5. `servers.json` 是服务器清单的唯一来源。采集端每隔 `SERVER_CONFIG_REFRESH_SECONDS`（默认 2 秒）重新读取它；网页每次刷新也按其当前顺序展示服务器，因此新增、删除或改名服务器不需要修改前端代码。
 
 ### 修改约定
 
@@ -200,5 +203,5 @@ sudo journalctl -u gpu-monitor.service -n 200 --no-pager
 | 所有服务器显示断线 | `systemctl status`、`journalctl`、私钥权限、部署机到目标机的网络和 SSH 连通性。 |
 | 单台服务器断线 | 该条 `servers.json` 配置、远程账号、公钥授权、`gpustat` 是否可运行、所需 PATH/环境变量。 |
 | 页面显示旧时间且红灯 | 这是断线保护行为：显示的是最后一次成功采集时间。检查该服务器的 SSH 和 `gpustat`。 |
-| 页面没有服务器卡片 | 确认服务已收到请求、`servers.json` 格式为数组、数据库目录可写，并检查前端固定布局配置。 |
+| 页面没有服务器卡片 | 确认服务已收到请求、`servers.json` 格式为数组，且数据库目录可写。 |
 | 终端出现控制符乱码 | 确认运行的是包含 DCS 清理逻辑的当前版本；必要时重启服务后等待下一次采样。 |

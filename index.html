@@ -1196,33 +1196,18 @@
       return panel;
     }
 
-    function buildNameMap(items) {
-      const map = new Map();
-      for (const item of items) {
-        const key = String(item.server_name || '').toLowerCase();
-        map.set(key, item);
-      }
-      return map;
-    }
-
     function renderRows(panels) {
-      const row1 = document.getElementById('row-1');
-      const row2 = document.getElementById('row-2');
-      const row3 = document.getElementById('row-3');
-      row1.innerHTML = '';
-      row2.innerHTML = '';
-      row3.innerHTML = '';
+      const container = document.querySelector('.container');
+      container.innerHTML = '';
 
-      const rows = [row1, row2, row3];
-      let rowIndex = 0;
-      let countInRow = 0;
-      for (const panel of panels) {
-        rows[rowIndex].appendChild(panel);
-        countInRow += 1;
-        if (countInRow >= 2) {
-          rowIndex = Math.min(rowIndex + 1, rows.length - 1);
-          countInRow = 0;
+      for (let index = 0; index < panels.length; index += 2) {
+        const row = document.createElement('div');
+        row.className = 'row-container';
+        row.appendChild(panels[index]);
+        if (panels[index + 1]) {
+          row.appendChild(panels[index + 1]);
         }
+        container.appendChild(row);
       }
     }
 
@@ -1306,20 +1291,7 @@
         }
       }
 
-      const byName = buildNameMap(items);
-      const layout = [
-        ['server15', 'server16'],
-        ['server30', 'server97'],
-        ['server247'],
-      ];
-
-      const panels = [];
-      for (const row of layout) {
-        for (const serverName of row) {
-          const item = byName.get(serverName) || { server_name: serverName, stdout_html: 'NULL' };
-          panels.push(createConsolePanel(item));
-        }
-      }
+      const panels = items.map((item) => createConsolePanel(item));
       renderRows(panels);
 
       const terminalsAfterRender = document.querySelectorAll('.terminal[data-server-key]');
@@ -1338,20 +1310,7 @@
     function renderResourceView(items) {
       updateResourceSelector(items);
       const resourceKey = document.getElementById('resource-select').value || currentResourceKey;
-      const byName = buildNameMap(items);
-      const layout = [
-        ['server15', 'server16'],
-        ['server30', 'server97'],
-        ['server247'],
-      ];
-
-      const panels = [];
-      for (const row of layout) {
-        for (const serverName of row) {
-          const item = byName.get(serverName) || { server_name: serverName, json_data: { gpus: [] } };
-          panels.push(createResourcePanel(item, resourceKey));
-        }
-      }
+      const panels = items.map((item) => createResourcePanel(item, resourceKey));
       renderRows(panels);
     }
 
