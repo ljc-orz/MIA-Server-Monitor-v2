@@ -37,6 +37,14 @@
 - Gunicorn、Flask、Paramiko、ansi2html。
 - 每台被监控机器：可通过 SSH 访问、已安装 `gpustat`，且该 SSH 用户执行 `gpustat -P --watch 2` 与 `gpustat --json` 均能成功。
 
+推荐在每台被监控机器安装 [`ljc-orz/gpustat` 的 `cuda_order` 分支](https://github.com/ljc-orz/gpustat/tree/cuda_order)，而不是未定制的版本。该版本在设置 `CUDA_DEVICE_ORDER=FASTEST_FIRST` 或 `CUDA_DEVICE_ORDER=PCI_BUS_ID` 时，会按 CUDA Runtime 的实际枚举顺序重排 GPU 编号；终端输出和 `--json` 中从 `0` 开始的编号可与 CUDA 逻辑设备编号对应。这让页面展示的 GPU 编号能直接用于 `CUDA_VISIBLE_DEVICES`。
+
+示例安装命令：
+
+```bash
+python3 -m pip install "git+https://github.com/ljc-orz/gpustat.git@cuda_order"
+```
+
 示例：在部署机创建虚拟环境并安装依赖。
 
 ```bash
