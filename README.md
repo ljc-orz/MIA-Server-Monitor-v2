@@ -168,6 +168,7 @@ sudo journalctl -u gpu-monitor.service -n 200 --no-pager
 
 - 两类采样会同时写入：终端文本表 `server_readings` 和 JSON 表 `server_json_readings`。
 - `fetched_at` 记录本次状态检查时间；`last_success_at` 记录最后一次成功采集时间。断线时页面展示后者，状态灯为红色。
+- `server_connection_state` 独立保存连接会话时间，不受采样数据清理影响：在线时页面显示本次首次在线时间，断线时显示最后一次在线时间。所有页面时间会自动转换为浏览器本地时区。
 - 程序启动时会自动创建或迁移 SQLite 表，无需手动建表。
 - 默认每 60 秒清理一次超过 10 分钟的采样数据。调整保留时间前应估算磁盘占用。
 - `collector.lock` 只协调本机同一项目目录下的进程；若部署多台监控机，它们会分别采集。

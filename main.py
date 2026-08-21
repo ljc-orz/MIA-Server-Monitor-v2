@@ -209,6 +209,39 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_server_json_readings_ip_id
             ON server_json_readings (ip, id DESC)
             """)
+
+        # Connection-session timestamps are kept separately from short-lived
+        # readings, so retention cleanup cannot remove them.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS server_connection_state (
+                ip TEXT PRIMARY KEY,
+                server_name TEXT NOT NULL,
+                connection_status TEXT NOT NULL DEFAULT 'unknown',
+                online_since_at TEXT NOT NULL DEFAULT '',
+                last_online_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )
+            """)
+        conn.execute("""
+            INSERT OR IGNORE INTO server_connection_state
+            (ip, server_name, connection_status, online_since_at, last_online_at, updated_at)
+            SELECT sr.ip,
+                   sr.server_name,
+                   'unknown',
+                   '',
+                   CASE
+                       WHEN sr.last_success_at != '' THEN sr.last_success_at
+                       WHEN sr.connection_status = 'connected' THEN sr.fetched_at
+                       ELSE ''
+                   END,
+                   sr.fetched_at
+            FROM server_readings sr
+            JOIN (
+                SELECT ip, MAX(id) AS max_id
+                FROM server_readings
+                GROUP BY ip
+            ) latest ON sr.id = latest.max_id
+            """)
         conn.commit()
 
 
@@ -384,6 +417,12 @@ def save_poll_result(
                     fetched_at,
                 ),
             )
+            update_server_connection_state(
+                conn=conn,
+                server=server,
+                connection_status=connection_status,
+                checked_at=fetched_at,
+            )
             maybe_prune(conn, fetched_at)
             conn.commit()
 
@@ -403,6 +442,79 @@ def fetch_latest_readings() -> list[dict]:
             """).fetchall()
 
     return [dict(row) for row in rows]
+
+
+def update_server_connection_state(
+    conn: sqlite3.Connection,
+    server: dict,
+    connection_status: str,
+    checked_at: str,
+) -> None:
+    """Persist the current connection session without relying on retained readings."""
+    ip = str(server.get("ip", ""))
+    server_name = str(server.get("name", "unknown"))
+    existing = conn.execute(
+        """
+        SELECT connection_status, online_since_at, last_online_at
+        FROM server_connection_state
+        WHERE ip = ?
+        """,
+        (ip,),
+    ).fetchone()
+
+    if connection_status == "connected":
+        is_continuing_session = (
+            existing is not None
+            and existing["connection_status"] == "connected"
+            and bool(existing["online_since_at"])
+        )
+        online_since_at = existing["online_since_at"] if is_continuing_session else checked_at
+        conn.execute(
+            """
+            INSERT INTO server_connection_state
+            (ip, server_name, connection_status, online_since_at, last_online_at, updated_at)
+            VALUES (?, ?, 'connected', ?, ?, ?)
+            ON CONFLICT(ip) DO UPDATE SET
+                server_name = excluded.server_name,
+                connection_status = excluded.connection_status,
+                online_since_at = excluded.online_since_at,
+                last_online_at = excluded.last_online_at,
+                updated_at = excluded.updated_at
+            """,
+            (ip, server_name, online_since_at, checked_at, checked_at),
+        )
+        return
+
+    if existing is None:
+        conn.execute(
+            """
+            INSERT INTO server_connection_state
+            (ip, server_name, connection_status, online_since_at, last_online_at, updated_at)
+            VALUES (?, ?, ?, '', '', ?)
+            """,
+            (ip, server_name, connection_status, checked_at),
+        )
+        return
+
+    conn.execute(
+        """
+        UPDATE server_connection_state
+        SET server_name = ?, connection_status = ?, updated_at = ?
+        WHERE ip = ?
+        """,
+        (server_name, connection_status, checked_at, ip),
+    )
+
+
+def fetch_connection_states() -> dict[str, dict]:
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT ip, connection_status, online_since_at, last_online_at
+            FROM server_connection_state
+            """
+        ).fetchall()
+    return {str(row["ip"]): dict(row) for row in rows}
 
 
 def fetch_latest_json_readings() -> list[dict]:
@@ -441,15 +553,19 @@ def merge_configured_servers(
 ) -> list[dict]:
     """Return configured servers in servers.json order, enriched with their latest reading."""
     readings_by_ip = {str(item.get("ip", "")): item for item in readings}
+    connection_states_by_ip = fetch_connection_states()
     results = []
     for server in load_servers(SERVERS_FILE):
         ip = str(server.get("ip", ""))
         item = dict(readings_by_ip.get(ip, {}))
+        connection_state = connection_states_by_ip.get(ip, {})
         item.update(
             {
                 "server_name": server.get("name", "unknown"),
                 "ip": ip,
                 "username": server.get("username", ""),
+                "online_since_at": connection_state.get("online_since_at", ""),
+                "last_online_at": connection_state.get("last_online_at", ""),
             }
         )
         item.setdefault("command", "")
