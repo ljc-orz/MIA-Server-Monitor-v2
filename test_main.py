@@ -23,6 +23,20 @@ class _HungChannel:
         self.closed = True
 
 
+class _FrameChannel(_HungChannel):
+    def __init__(self, frame):
+        super().__init__()
+        self.frame = frame.encode("utf-8")
+
+    def recv_ready(self):
+        return bool(self.frame)
+
+    def recv(self, size):
+        chunk = self.frame[:size]
+        self.frame = self.frame[size:]
+        return chunk
+
+
 class _Stream:
     def __init__(self, channel):
         self.channel = channel
@@ -98,6 +112,32 @@ class FallbackProbeTests(unittest.TestCase):
         self.assertFalse(probe["all_ready"])
         self.assertTrue(probe["recovery_ready"])
 
+    def test_noncritical_xid_is_informational_only(self):
+        output = "\n".join(
+            [
+                "GPU\t0000:57:00.0\t0x2204\tnvidia\tactive\ta1\tpci-visible",
+                "KERNEL\tNVRM: Xid (PCI:0000:57:00): 31, pid=1234",
+            ]
+        )
+
+        probe = main.parse_pci_fallback_probe(output, set())
+
+        self.assertEqual(probe["devices"][0]["state"], "pci_present")
+        self.assertTrue(probe["all_ready"])
+
+    def test_critical_xid_marks_driver_error(self):
+        output = "\n".join(
+            [
+                "GPU\t0000:57:00.0\t0x2204\tnvidia\tactive\ta1\tpci-visible",
+                "KERNEL\tNVRM: Xid (PCI:0000:57:00): 79, GPU has fallen off",
+            ]
+        )
+
+        probe = main.parse_pci_fallback_probe(output, set())
+
+        self.assertEqual(probe["devices"][0]["state"], "driver_error")
+        self.assertFalse(probe["all_ready"])
+
     def test_fallback_text_contains_device_states(self):
         probe = main.parse_pci_fallback_probe(
             "\n".join(
@@ -166,6 +206,7 @@ class FallbackProbeTests(unittest.TestCase):
             ),
             mock.patch.object(main, "probe_pci_fallback", return_value=probe),
             mock.patch.object(main, "save_poll_result", side_effect=capture_result),
+            mock.patch.object(main, "record_collector_event"),
         ):
             main.poll_server_forever(
                 {"name": "gpu-test", "ip": "192.0.2.10", "username": "monitor"},
@@ -209,12 +250,25 @@ class FallbackProbeTests(unittest.TestCase):
                 raise main.RemoteCommandTimeout("gpustat timeout")
             return '{"gpus": []}', "", 0
 
-        watch_channel = _HungChannel()
+        watch_channel = _FrameChannel(
+            "Wed Sep 23 10:00:00 2026\n[0] NVIDIA GPU | 30'C, 0 %\n"
+        )
 
         def start_watch(*args, **kwargs):
-            server_stop_event.set()
             stream = _Stream(watch_channel)
             return stream, stream
+
+        saved_results = []
+
+        def capture_result(**kwargs):
+            saved_results.append(kwargs)
+            if kwargs["status"] == "ok":
+                server_stop_event.set()
+
+        events = []
+
+        def capture_event(server, event_type, reason="", details=None):
+            events.append(event_type)
 
         with (
             mock.patch.object(main, "fetch_last_success_at", return_value=None),
@@ -228,10 +282,74 @@ class FallbackProbeTests(unittest.TestCase):
             mock.patch.object(
                 main,
                 "probe_pci_fallback",
-                side_effect=[failed_probe, recovered_probe],
+                side_effect=[failed_probe, recovered_probe, recovered_probe],
             ),
             mock.patch.object(main, "start_watch_streams", side_effect=start_watch),
-            mock.patch.object(main, "save_poll_result"),
+            mock.patch.object(
+                main,
+                "save_poll_result",
+                side_effect=capture_result,
+            ),
+            mock.patch.object(main, "save_json_poll_result"),
+            mock.patch.object(
+                main,
+                "save_text_poll_result",
+                side_effect=capture_result,
+            ),
+            mock.patch.object(
+                main,
+                "record_collector_event",
+                side_effect=capture_event,
+            ),
+            mock.patch.object(main, "FALLBACK_POLL_INTERVAL_SECONDS", 0),
+            mock.patch.object(main, "GPUSTAT_RECOVERY_CONFIRM_INTERVAL_SECONDS", 0),
+        ):
+            main.poll_server_forever(
+                {"name": "gpu-test", "ip": "192.0.2.10", "username": "monitor"},
+                server_stop_event,
+            )
+
+        self.assertEqual(gpustat_calls, 3)
+        self.assertIn("recovered", events)
+        self.assertEqual(saved_results[-1]["status"], "ok")
+        self.assertTrue(watch_channel.closed)
+        self.assertTrue(client.closed)
+
+    def test_three_consecutive_soft_failures_enter_degraded_mode(self):
+        server_stop_event = threading.Event()
+        client = _ActiveClient()
+        probe = main.parse_pci_fallback_probe(
+            "GPU\t0000:33:00.0\t0x2204\tnvidia\tactive\ta1\tpci-visible",
+            set(),
+        )
+        saved_results = []
+        events = []
+
+        def capture_result(**kwargs):
+            saved_results.append(kwargs)
+            if kwargs["status"] == "degraded":
+                server_stop_event.set()
+
+        def capture_event(server, event_type, reason="", details=None):
+            events.append((event_type, details or {}))
+
+        with (
+            mock.patch.object(main, "fetch_last_success_at", return_value=None),
+            mock.patch.object(main, "fetch_latest_collector_state", return_value={}),
+            mock.patch.object(main, "connect_ssh_client", return_value=client),
+            mock.patch.object(
+                main,
+                "fetch_gpustat_json_bounded",
+                side_effect=RuntimeError("temporary gpustat error"),
+            ) as gpustat_mock,
+            mock.patch.object(main, "probe_pci_fallback", return_value=probe),
+            mock.patch.object(main, "save_poll_result", side_effect=capture_result),
+            mock.patch.object(
+                main,
+                "record_collector_event",
+                side_effect=capture_event,
+            ),
+            mock.patch.object(main, "POLL_INTERVAL_SECONDS", 0),
             mock.patch.object(main, "FALLBACK_POLL_INTERVAL_SECONDS", 0),
         ):
             main.poll_server_forever(
@@ -239,9 +357,136 @@ class FallbackProbeTests(unittest.TestCase):
                 server_stop_event,
             )
 
-        self.assertEqual(gpustat_calls, 2)
+        self.assertEqual(gpustat_mock.call_count, 3)
+        self.assertEqual(saved_results[-1]["status"], "degraded")
+        self.assertEqual(
+            [
+                details["failure_count"]
+                for event, details in events
+                if event == "gpustat_soft_failure"
+            ],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            [event for event, _ in events].count("degraded_entered"),
+            1,
+        )
+
+    def test_success_resets_consecutive_soft_failure_count(self):
+        server_stop_event = threading.Event()
+        client = _ActiveClient()
+        watch_channel = _HungChannel()
+        stream = _Stream(watch_channel)
+        soft_error = RuntimeError("temporary gpustat error")
+        events = []
+
+        def capture_event(server, event_type, reason="", details=None):
+            events.append((event_type, details or {}))
+            soft_events = [
+                event
+                for event, _ in events
+                if event == "gpustat_soft_failure"
+            ]
+            if len(soft_events) == 4:
+                server_stop_event.set()
+
+        with (
+            mock.patch.object(main, "fetch_last_success_at", return_value=None),
+            mock.patch.object(main, "fetch_latest_collector_state", return_value={}),
+            mock.patch.object(main, "connect_ssh_client", return_value=client),
+            mock.patch.object(
+                main,
+                "fetch_gpustat_json_bounded",
+                side_effect=[
+                    soft_error,
+                    soft_error,
+                    ('{"gpus": []}', "", 0),
+                    soft_error,
+                    soft_error,
+                ],
+            ),
+            mock.patch.object(
+                main,
+                "start_watch_streams",
+                return_value=(stream, stream),
+            ),
+            mock.patch.object(main, "save_poll_result"),
+            mock.patch.object(main, "save_json_poll_result"),
+            mock.patch.object(main, "save_text_poll_result"),
+            mock.patch.object(
+                main,
+                "record_collector_event",
+                side_effect=capture_event,
+            ),
+            mock.patch.object(main, "POLL_INTERVAL_SECONDS", 0),
+            mock.patch.object(main, "GPUSTAT_WATCH_STALE_SECONDS", 999),
+        ):
+            main.poll_server_forever(
+                {"name": "gpu-test", "ip": "192.0.2.10", "username": "monitor"},
+                server_stop_event,
+            )
+
+        self.assertEqual(
+            [
+                details["failure_count"]
+                for event, details in events
+                if event == "gpustat_soft_failure"
+            ],
+            [1, 2, 1, 2],
+        )
+        self.assertNotIn("degraded_entered", [event for event, _ in events])
+
+    def test_stale_watch_restarts_without_entering_degraded_mode(self):
+        server_stop_event = threading.Event()
+        client = _ActiveClient()
+        watch_channel = _HungChannel()
+        stream = _Stream(watch_channel)
+        saved_results = []
+        events = []
+
+        def capture_event(server, event_type, reason="", details=None):
+            events.append(event_type)
+            if event_type == "watch_restarted":
+                server_stop_event.set()
+
+        with (
+            mock.patch.object(main, "fetch_last_success_at", return_value=None),
+            mock.patch.object(main, "fetch_latest_collector_state", return_value={}),
+            mock.patch.object(main, "connect_ssh_client", return_value=client),
+            mock.patch.object(
+                main,
+                "fetch_gpustat_json_bounded",
+                return_value=('{"gpus": []}', "", 0),
+            ),
+            mock.patch.object(
+                main,
+                "start_watch_streams",
+                return_value=(stream, stream),
+            ),
+            mock.patch.object(
+                main,
+                "save_poll_result",
+                side_effect=lambda **kwargs: saved_results.append(kwargs),
+            ),
+            mock.patch.object(main, "save_json_poll_result"),
+            mock.patch.object(main, "save_text_poll_result"),
+            mock.patch.object(
+                main,
+                "record_collector_event",
+                side_effect=capture_event,
+            ),
+            mock.patch.object(main, "POLL_INTERVAL_SECONDS", 0),
+            mock.patch.object(main, "GPUSTAT_WATCH_STALE_SECONDS", 0),
+        ):
+            main.poll_server_forever(
+                {"name": "gpu-test", "ip": "192.0.2.10", "username": "monitor"},
+                server_stop_event,
+            )
+
+        self.assertIn("watch_restarted", events)
+        self.assertNotIn("degraded_entered", events)
+        self.assertFalse(any(item["status"] == "degraded" for item in saved_results))
         self.assertTrue(watch_channel.closed)
-        self.assertTrue(client.closed)
 
     def test_polling_preserves_degraded_circuit_breaker_after_restart(self):
         server_stop_event = threading.Event()
@@ -286,6 +531,7 @@ class FallbackProbeTests(unittest.TestCase):
                 "save_poll_result",
                 side_effect=stop_after_fallback,
             ),
+            mock.patch.object(main, "record_collector_event"),
         ):
             main.poll_server_forever(
                 {"name": "gpu-test", "ip": "192.0.2.10", "username": "monitor"},

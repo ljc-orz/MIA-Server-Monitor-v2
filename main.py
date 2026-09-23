@@ -27,6 +27,12 @@ SSH_TIMEOUT_SECONDS = int(os.getenv("SSH_TIMEOUT_SECONDS", "10"))
 GPUSTAT_COMMAND_TIMEOUT_SECONDS = float(
     os.getenv("GPUSTAT_COMMAND_TIMEOUT_SECONDS", "8")
 )
+GPUSTAT_WATCH_STALE_SECONDS = float(
+    os.getenv("GPUSTAT_WATCH_STALE_SECONDS", "15")
+)
+GPUSTAT_SOFT_FAILURE_THRESHOLD = int(
+    os.getenv("GPUSTAT_SOFT_FAILURE_THRESHOLD", "3")
+)
 FALLBACK_POLL_INTERVAL_SECONDS = float(
     os.getenv("FALLBACK_POLL_INTERVAL_SECONDS", "10")
 )
@@ -36,10 +42,24 @@ FALLBACK_COMMAND_TIMEOUT_SECONDS = float(
 GPUSTAT_RECOVERY_PROBE_SECONDS = float(
     os.getenv("GPUSTAT_RECOVERY_PROBE_SECONDS", "300")
 )
+GPUSTAT_HEALTHY_RECOVERY_RETRY_SECONDS = float(
+    os.getenv("GPUSTAT_HEALTHY_RECOVERY_RETRY_SECONDS", "15")
+)
+GPUSTAT_RECOVERY_CONFIRM_SUCCESSES = int(
+    os.getenv("GPUSTAT_RECOVERY_CONFIRM_SUCCESSES", "2")
+)
+GPUSTAT_RECOVERY_CONFIRM_INTERVAL_SECONDS = float(
+    os.getenv("GPUSTAT_RECOVERY_CONFIRM_INTERVAL_SECONDS", "2")
+)
+COLLECTOR_EVENT_RETENTION_DAYS = int(
+    os.getenv("COLLECTOR_EVENT_RETENTION_DAYS", "30")
+)
 RETENTION_MINUTES = int(os.getenv("RETENTION_MINUTES", "10"))
 PRUNE_INTERVAL_SECONDS = int(os.getenv("PRUNE_INTERVAL_SECONDS", "60"))
 SERVER_CONFIG_REFRESH_SECONDS = int(os.getenv("SERVER_CONFIG_REFRESH_SECONDS", "10"))
 
+# Deliberately avoid remote process-state inspection here. Degraded-mode decisions
+# are based only on bounded command results, PCI/sysfs data, and kernel messages.
 PCI_FALLBACK_COMMAND = r"""
 boot_id=""
 if [ -r /proc/sys/kernel/random/boot_id ]; then
@@ -328,6 +348,21 @@ def init_db() -> None:
                 GROUP BY ip
             ) latest ON sr.id = latest.max_id
             """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS collector_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_name TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            )
+            """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_collector_events_ip_created_at
+            ON collector_events (ip, created_at DESC)
+            """)
         conn.commit()
 
 
@@ -353,6 +388,19 @@ def prune_old_json_readings(conn: sqlite3.Connection, fetched_at: str) -> None:
     )
     if cursor.rowcount > 0:
         app.logger.info("已清理 server_json_readings 过期数据 %s 条", cursor.rowcount)
+
+
+def prune_old_collector_events(conn: sqlite3.Connection, fetched_at: str) -> None:
+    cutoff = (
+        datetime.fromisoformat(fetched_at)
+        - timedelta(days=COLLECTOR_EVENT_RETENTION_DAYS)
+    ).isoformat()
+    cursor = conn.execute(
+        "DELETE FROM collector_events WHERE created_at < ?",
+        (cutoff,),
+    )
+    if cursor.rowcount > 0:
+        app.logger.info("已清理 collector_events 过期数据 %s 条", cursor.rowcount)
 
 
 def ansi_to_html_fragment(text: str) -> str:
@@ -440,6 +488,7 @@ def maybe_prune(conn: sqlite3.Connection, fetched_at: str) -> None:
 
     prune_old_readings(conn, fetched_at)
     prune_old_json_readings(conn, fetched_at)
+    prune_old_collector_events(conn, fetched_at)
     last_prune_at_epoch = now_epoch
 
 
@@ -511,6 +560,127 @@ def save_poll_result(
             )
             maybe_prune(conn, fetched_at)
             conn.commit()
+
+
+def save_json_poll_result(
+    server: dict,
+    json_command: str,
+    json_stdout: str,
+    json_exit_code: int | None,
+    json_status: str,
+    connection_status: str,
+    fetched_at: str,
+    json_last_success_at: str | None,
+) -> None:
+    """Persist fresh JSON data without replacing the last terminal frame."""
+    with db_lock:
+        with get_db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO server_json_readings
+                (server_name, ip, username, command, stdout_json, exit_code, status, connection_status, last_success_at, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    server.get("name", "unknown"),
+                    server.get("ip", ""),
+                    server.get("username", ""),
+                    json_command,
+                    json_stdout,
+                    json_exit_code,
+                    json_status,
+                    connection_status,
+                    json_last_success_at or "",
+                    fetched_at,
+                ),
+            )
+            update_server_connection_state(
+                conn=conn,
+                server=server,
+                connection_status=connection_status,
+                checked_at=fetched_at,
+            )
+            maybe_prune(conn, fetched_at)
+            conn.commit()
+
+
+def save_text_poll_result(
+    server: dict,
+    command: str,
+    stdout: str,
+    stderr: str,
+    exit_code: int | None,
+    status: str,
+    connection_status: str,
+    fetched_at: str,
+    last_success_at: str | None,
+) -> None:
+    """Persist a terminal frame without duplicating stale JSON data."""
+    stdout_html = ansi_to_html_fragment(stdout)
+    with db_lock:
+        with get_db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO server_readings
+                (server_name, ip, username, command, stdout, stdout_html, stderr, exit_code, status, connection_status, last_success_at, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    server.get("name", "unknown"),
+                    server.get("ip", ""),
+                    server.get("username", ""),
+                    command,
+                    stdout,
+                    stdout_html,
+                    stderr,
+                    exit_code,
+                    status,
+                    connection_status,
+                    last_success_at or "",
+                    fetched_at,
+                ),
+            )
+            update_server_connection_state(
+                conn=conn,
+                server=server,
+                connection_status=connection_status,
+                checked_at=fetched_at,
+            )
+            maybe_prune(conn, fetched_at)
+            conn.commit()
+
+
+def record_collector_event(
+    server: dict,
+    event_type: str,
+    reason: str = "",
+    details: dict | None = None,
+) -> None:
+    created_at = utc_now_iso()
+    try:
+        with db_lock:
+            with get_db_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO collector_events
+                    (server_name, ip, event_type, reason, details_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        server.get("name", "unknown"),
+                        server.get("ip", ""),
+                        event_type,
+                        reason,
+                        json.dumps(details or {}, ensure_ascii=False, sort_keys=True),
+                        created_at,
+                    ),
+                )
+                conn.commit()
+    except Exception:
+        app.logger.exception(
+            "记录服务器 %s 的采集事件失败",
+            server.get("name", "unknown"),
+        )
 
 
 def fetch_latest_readings() -> list[dict]:
@@ -851,9 +1021,14 @@ def parse_pci_fallback_probe(output: str, known_gpu_bdfs: set[str]) -> dict:
 
     for device in devices_by_bdf.values():
         bdf = device["bdf"]
-        has_kernel_error = any(
-            bdf in message.lower()
-            and re.search(r"NVRM|Xid|fallen off|rm_init_adapter", message, re.I)
+        bdf_without_function = bdf.rsplit(".", 1)[0]
+        has_critical_kernel_error = any(
+            bdf_without_function in message.lower()
+            and re.search(
+                r"fallen off|rm_init_adapter|\bXid\b.*?:\s*(?:79|95|119|120)\b",
+                message,
+                re.I,
+            )
             for message in kernel_messages
         )
         if device["access"] == "missing":
@@ -862,7 +1037,7 @@ def parse_pci_fallback_probe(output: str, known_gpu_bdfs: set[str]) -> dict:
             state = "pci_unreachable"
         elif device["driver"] != "nvidia":
             state = "driver_unbound"
-        elif has_kernel_error:
+        elif has_critical_kernel_error:
             state = "driver_error"
         else:
             state = "pci_present"
@@ -1020,12 +1195,12 @@ def poll_server_forever(server: dict, server_stop_event: threading.Event) -> Non
     text_stderr_stream = ""
     latest_json_text = ""
     latest_json_exit_code: int | None = None
-    latest_json_status = "error"
     last_json_polled_at = 0.0
     save_interval = max(0.3, POLL_INTERVAL_SECONDS * 0.5)
     last_saved_at = 0.0
     last_watch_output_at = 0.0
     degraded = previous_state.get("status") == "degraded"
+    recovering = False
     degraded_reason = (
         str(previous_state.get("stderr") or "continuing previous degraded state")
         if degraded
@@ -1049,11 +1224,110 @@ def poll_server_forever(server: dict, server_stop_event: threading.Event) -> Non
     )
     last_fallback_polled_at = 0.0
     last_fallback_recovery_ready: bool | None = None
-    last_recovery_attempt_at = time.monotonic() if degraded else 0.0
+    recovery_json_successes = 0
+    recovery_failure_count = 0
+    next_recovery_attempt_at = (
+        time.monotonic() + GPUSTAT_HEALTHY_RECOVERY_RETRY_SECONDS
+        if degraded
+        else 0.0
+    )
+    json_soft_failure_count = 0
+    last_json_success_monotonic = 0.0
+    watch_restart_failures = 0
+    watch_retry_not_before = 0.0
     last_success_at = fetch_last_success_at("server_readings", server_ip)
     last_json_success_at = fetch_last_success_at(
         "server_json_readings", server_ip
     )
+
+    def retry_backoff_seconds(failure_count: int) -> float:
+        if failure_count <= 0:
+            return GPUSTAT_HEALTHY_RECOVERY_RETRY_SECONDS
+        if failure_count == 1:
+            return min(GPUSTAT_RECOVERY_PROBE_SECONDS, 60.0)
+        return GPUSTAT_RECOVERY_PROBE_SECONDS
+
+    def transport_is_active() -> bool:
+        transport = client.get_transport() if client is not None else None
+        return transport is not None and transport.is_active()
+
+    def enter_degraded(reason: str, now: float, trigger: str) -> None:
+        nonlocal degraded, recovering, degraded_reason
+        nonlocal text_stdout, text_stderr, text_stream
+        nonlocal latest_json_text, latest_json_exit_code
+        nonlocal last_fallback_polled_at, last_fallback_recovery_ready
+        nonlocal recovery_json_successes, recovery_failure_count
+        nonlocal next_recovery_attempt_at, json_soft_failure_count
+
+        was_degraded = degraded
+        close_watch_streams(text_stdout, text_stderr)
+        text_stdout = None
+        text_stderr = None
+        text_stream = ""
+        degraded = True
+        recovering = False
+        degraded_reason = reason[:500]
+        latest_json_text = ""
+        latest_json_exit_code = None
+        last_fallback_polled_at = 0.0
+        last_fallback_recovery_ready = None
+        recovery_json_successes = 0
+        recovery_failure_count = 0
+        next_recovery_attempt_at = (
+            now + GPUSTAT_HEALTHY_RECOVERY_RETRY_SECONDS
+        )
+        json_soft_failure_count = 0
+
+        if not was_degraded:
+            record_collector_event(
+                server,
+                "degraded_entered",
+                degraded_reason,
+                {"trigger": trigger},
+            )
+        app.logger.warning(
+            "服务器 %s 进入 PCI 降级采集: %s",
+            server.get("name", "unknown"),
+            degraded_reason,
+        )
+
+    def handle_json_failure(exc: Exception, now: float, stage: str) -> bool:
+        nonlocal json_soft_failure_count, last_json_polled_at
+
+        if not transport_is_active():
+            raise exc
+        last_json_polled_at = now
+        if isinstance(exc, RemoteCommandTimeout):
+            enter_degraded(
+                f"{stage} timed out: {exc}",
+                now,
+                "json_timeout",
+            )
+            return True
+
+        json_soft_failure_count += 1
+        reason = f"{stage} soft failure: {exc}"[:500]
+        record_collector_event(
+            server,
+            "gpustat_soft_failure",
+            reason,
+            {
+                "failure_count": json_soft_failure_count,
+                "threshold": max(1, GPUSTAT_SOFT_FAILURE_THRESHOLD),
+            },
+        )
+        app.logger.warning(
+            "服务器 %s 的 %s 发生软失败 (%s/%s): %s",
+            server.get("name", "unknown"),
+            stage,
+            json_soft_failure_count,
+            max(1, GPUSTAT_SOFT_FAILURE_THRESHOLD),
+            exc,
+        )
+        if json_soft_failure_count >= max(1, GPUSTAT_SOFT_FAILURE_THRESHOLD):
+            enter_degraded(reason, now, "consecutive_json_failures")
+            return True
+        return False
 
     while not stop_event.is_set() and not server_stop_event.is_set():
         try:
@@ -1066,18 +1340,27 @@ def poll_server_forever(server: dict, server_stop_event: threading.Event) -> Non
                 text_stderr_stream = ""
                 latest_json_text = ""
                 latest_json_exit_code = None
-                latest_json_status = "error"
                 last_saved_at = 0.0
                 last_json_polled_at = 0.0
+                last_json_success_monotonic = 0.0
+                json_soft_failure_count = 0
                 last_watch_output_at = 0.0
                 last_fallback_polled_at = 0.0
+                watch_restart_failures = 0
+                watch_retry_not_before = 0.0
 
             now = time.monotonic()
 
             if degraded:
+                fallback_poll_interval = FALLBACK_POLL_INTERVAL_SECONDS
+                if recovery_json_successes > 0:
+                    fallback_poll_interval = min(
+                        fallback_poll_interval,
+                        GPUSTAT_RECOVERY_CONFIRM_INTERVAL_SECONDS,
+                    )
                 if (
                     now - last_fallback_polled_at
-                    < FALLBACK_POLL_INTERVAL_SECONDS
+                    < fallback_poll_interval
                 ):
                     if server_stop_event.wait(0.2) or stop_event.is_set():
                         break
@@ -1164,12 +1447,11 @@ def poll_server_forever(server: dict, server_stop_event: threading.Event) -> Non
                     last_fallback_recovery_ready is False
                     and probe["recovery_ready"]
                 )
-                periodic_retry_due = (
-                    now - last_recovery_attempt_at
-                    >= GPUSTAT_RECOVERY_PROBE_SECONDS
-                )
+                if not probe["recovery_ready"]:
+                    recovery_json_successes = 0
+                retry_due = now >= next_recovery_attempt_at
                 should_try_recovery = probe["recovery_ready"] and (
-                    boot_changed or became_ready or periodic_retry_due
+                    boot_changed or became_ready or retry_due
                 )
                 if probe_boot_id:
                     degraded_boot_id = probe_boot_id
@@ -1177,7 +1459,6 @@ def poll_server_forever(server: dict, server_stop_event: threading.Event) -> Non
                 last_fallback_polled_at = time.monotonic()
 
                 if should_try_recovery:
-                    last_recovery_attempt_at = time.monotonic()
                     try:
                         (
                             latest_json_text,
@@ -1191,43 +1472,102 @@ def poll_server_forever(server: dict, server_stop_event: threading.Event) -> Non
                     except PollingStopped:
                         break
                     except Exception as exc:
+                        recovery_json_successes = 0
+                        recovery_failure_count += 1
+                        delay = retry_backoff_seconds(recovery_failure_count)
+                        next_recovery_attempt_at = time.monotonic() + delay
                         degraded_reason = f"gpustat recovery probe failed: {exc}"[
                             :500
                         ]
+                        record_collector_event(
+                            server,
+                            "recovery_probe_failed",
+                            degraded_reason,
+                            {
+                                "failure_count": recovery_failure_count,
+                                "next_retry_seconds": delay,
+                            },
+                        )
                         app.logger.warning(
-                            "服务器 %s 的 gpustat 恢复探测失败: %s",
+                            "服务器 %s 的 gpustat 恢复探测失败，%ss 后重试: %s",
                             server.get("name", "unknown"),
+                            delay,
                             exc,
                         )
                     else:
-                        latest_json_status = "ok"
+                        recovery_failure_count = 0
+                        recovery_json_successes += 1
                         last_json_success_at = utc_now_iso()
                         last_json_polled_at = time.monotonic()
+                        last_json_success_monotonic = last_json_polled_at
                         if json_err:
                             text_stderr_stream = json_err[-20000:]
-                        text_stdout, text_stderr = start_watch_streams(
-                            client,
-                            watch_command,
+                        record_collector_event(
+                            server,
+                            "recovery_confirmation",
+                            "gpustat --json recovery confirmation succeeded",
+                            {
+                                "success_count": recovery_json_successes,
+                                "required": max(
+                                    1, GPUSTAT_RECOVERY_CONFIRM_SUCCESSES
+                                ),
+                            },
                         )
-                        text_stream = ""
-                        last_watch_output_at = time.monotonic()
-                        last_saved_at = 0.0
-                        degraded = False
-                        degraded_reason = ""
-                        degraded_boot_id = probe_boot_id
-                        last_fallback_recovery_ready = None
-                        app.logger.info(
-                            "服务器 %s 的 gpustat 已恢复，切回正常采集",
-                            server.get("name", "unknown"),
-                        )
+                        if recovery_json_successes < max(
+                            1, GPUSTAT_RECOVERY_CONFIRM_SUCCESSES
+                        ):
+                            next_recovery_attempt_at = (
+                                time.monotonic()
+                                + GPUSTAT_RECOVERY_CONFIRM_INTERVAL_SECONDS
+                            )
+                        else:
+                            try:
+                                text_stdout, text_stderr = start_watch_streams(
+                                    client,
+                                    watch_command,
+                                )
+                            except Exception as exc:
+                                if not transport_is_active():
+                                    raise
+                                recovery_json_successes = 0
+                                recovery_failure_count = 1
+                                delay = retry_backoff_seconds(
+                                    recovery_failure_count
+                                )
+                                next_recovery_attempt_at = (
+                                    time.monotonic() + delay
+                                )
+                                degraded_reason = (
+                                    f"gpustat watch recovery failed: {exc}"
+                                )[:500]
+                                record_collector_event(
+                                    server,
+                                    "recovery_probe_failed",
+                                    degraded_reason,
+                                    {"next_retry_seconds": delay},
+                                )
+                            else:
+                                text_stream = ""
+                                last_watch_output_at = time.monotonic()
+                                last_saved_at = 0.0
+                                degraded = False
+                                recovering = True
+                                degraded_boot_id = probe_boot_id
+                                last_fallback_recovery_ready = None
+                                json_soft_failure_count = 0
+                                app.logger.info(
+                                    "服务器 %s 已通过 JSON 恢复确认，等待新的 watch 帧",
+                                    server.get("name", "unknown"),
+                                )
 
                 if server_stop_event.wait(0.2) or stop_event.is_set():
                     break
                 continue
 
-            has_update = False
-
-            if text_stdout is None:
+            json_updated = False
+            watch_updated = False
+            now = time.monotonic()
+            if now - last_json_polled_at >= POLL_INTERVAL_SECONDS:
                 try:
                     (
                         latest_json_text,
@@ -1241,37 +1581,69 @@ def poll_server_forever(server: dict, server_stop_event: threading.Event) -> Non
                 except PollingStopped:
                     break
                 except Exception as exc:
-                    degraded = True
-                    degraded_reason = f"gpustat initial probe failed: {exc}"[:500]
-                    last_recovery_attempt_at = time.monotonic()
-                    last_fallback_polled_at = 0.0
-                    last_fallback_recovery_ready = None
-                    close_watch_streams(text_stdout, text_stderr)
-                    text_stdout = None
-                    text_stderr = None
-                    app.logger.warning(
-                        "服务器 %s 进入 PCI 降级采集: %s",
-                        server.get("name", "unknown"),
-                        exc,
+                    stage = (
+                        "gpustat recovery validation"
+                        if recovering
+                        else "gpustat --json"
                     )
+                    if handle_json_failure(exc, time.monotonic(), stage):
+                        continue
+                    if server_stop_event.wait(0.2) or stop_event.is_set():
+                        break
                     continue
 
-                latest_json_status = "ok"
+                json_soft_failure_count = 0
                 last_json_success_at = utc_now_iso()
                 last_json_polled_at = time.monotonic()
+                last_json_success_monotonic = last_json_polled_at
+                json_updated = True
                 if json_err:
                     text_stderr_stream = (text_stderr_stream + "\n" + json_err)[
                         -20000:
                     ]
-                text_stdout, text_stderr = start_watch_streams(client, watch_command)
-                last_watch_output_at = time.monotonic()
+
+            if (
+                text_stdout is None
+                and last_json_success_monotonic > 0
+                and time.monotonic() >= watch_retry_not_before
+            ):
+                try:
+                    text_stdout, text_stderr = start_watch_streams(
+                        client,
+                        watch_command,
+                    )
+                except Exception as exc:
+                    if not transport_is_active():
+                        raise
+                    watch_restart_failures += 1
+                    delay = retry_backoff_seconds(
+                        max(0, watch_restart_failures - 1)
+                    )
+                    watch_retry_not_before = time.monotonic() + delay
+                    record_collector_event(
+                        server,
+                        "watch_restart_failed",
+                        str(exc)[:500],
+                        {"next_retry_seconds": delay},
+                    )
+                    if recovering:
+                        enter_degraded(
+                            f"gpustat watch recovery failed: {exc}",
+                            time.monotonic(),
+                            "recovery_watch_failure",
+                        )
+                        continue
+                else:
+                    last_watch_output_at = time.monotonic()
 
             if text_stdout is not None and text_stdout.channel.recv_ready():
                 chunk = text_stdout.channel.recv(65535).decode("utf-8", errors="ignore")
                 if chunk:
                     text_stream += chunk
                     last_watch_output_at = time.monotonic()
-                    has_update = True
+                    watch_updated = True
+                    watch_restart_failures = 0
+                    watch_retry_not_before = 0.0
 
             if text_stderr is not None and text_stderr.channel.recv_stderr_ready():
                 err_chunk = text_stderr.channel.recv_stderr(65535).decode(
@@ -1288,111 +1660,120 @@ def poll_server_forever(server: dict, server_stop_event: threading.Event) -> Non
             )
             watch_timed_out = (
                 text_stdout is not None
-                and now - last_watch_output_at >= GPUSTAT_COMMAND_TIMEOUT_SECONDS
+                and now - last_watch_output_at >= GPUSTAT_WATCH_STALE_SECONDS
             )
             if watch_exited or watch_timed_out:
-                degraded = True
                 if watch_exited:
-                    degraded_reason = "gpustat watch exited before producing a usable frame"
+                    watch_reason = "gpustat watch exited"
                 elif not normalized_text:
-                    degraded_reason = (
+                    watch_reason = (
                         "gpustat watch produced no frame within "
-                        f"{GPUSTAT_COMMAND_TIMEOUT_SECONDS:g}s"
+                        f"{GPUSTAT_WATCH_STALE_SECONDS:g}s"
                     )
                 else:
-                    degraded_reason = (
+                    watch_reason = (
                         "gpustat watch stopped updating for "
-                        f"{GPUSTAT_COMMAND_TIMEOUT_SECONDS:g}s"
+                        f"{GPUSTAT_WATCH_STALE_SECONDS:g}s"
                     )
-                last_recovery_attempt_at = now
-                last_fallback_polled_at = 0.0
-                last_fallback_recovery_ready = None
                 close_watch_streams(text_stdout, text_stderr)
                 text_stdout = None
                 text_stderr = None
-                app.logger.warning(
-                    "服务器 %s 进入 PCI 降级采集: %s",
-                    server.get("name", "unknown"),
-                    degraded_reason,
+                watch_restart_failures += 1
+                delay = retry_backoff_seconds(
+                    max(0, watch_restart_failures - 1)
                 )
-                continue
-
-            if now - last_json_polled_at >= POLL_INTERVAL_SECONDS:
-                try:
-                    (
-                        latest_json_text,
-                        json_err,
-                        latest_json_exit_code,
-                    ) = fetch_gpustat_json_bounded(
-                        client,
-                        json_command,
-                        server_stop_event,
-                    )
-                    if json_err:
-                        text_stderr_stream = (text_stderr_stream + "\n" + json_err)[
-                            -20000:
-                        ]
-                    latest_json_status = "ok"
-                    last_json_success_at = utc_now_iso()
-                except PollingStopped:
-                    break
-                except Exception as exc:
-                    degraded = True
-                    degraded_reason = f"gpustat --json failed: {exc}"[:500]
-                    last_recovery_attempt_at = now
-                    last_fallback_polled_at = 0.0
-                    last_fallback_recovery_ready = None
-                    close_watch_streams(text_stdout, text_stderr)
-                    text_stdout = None
-                    text_stderr = None
-                    latest_json_text = ""
-                    latest_json_exit_code = None
-                    latest_json_status = "degraded"
-                    app.logger.warning(
-                        "服务器 %s 进入 PCI 降级采集: %s",
-                        server.get("name", "unknown"),
-                        exc,
+                watch_retry_not_before = now + delay
+                record_collector_event(
+                    server,
+                    "watch_restarted",
+                    watch_reason,
+                    {
+                        "restart_count": watch_restart_failures,
+                        "next_retry_seconds": delay,
+                        "json_still_healthy": True,
+                    },
+                )
+                app.logger.warning(
+                    "服务器 %s 的 watch 异常，JSON 正常，%ss 后仅重启 watch: %s",
+                    server.get("name", "unknown"),
+                    delay,
+                    watch_reason,
+                )
+                if recovering:
+                    enter_degraded(
+                        f"recovery watch failed: {watch_reason}",
+                        now,
+                        "recovery_watch_failure",
                     )
                     continue
-                last_json_polled_at = now
-                has_update = True
 
+            saved_both = False
             if (
-                has_update
+                watch_updated
                 and normalized_text
                 and now - last_saved_at >= save_interval
             ):
                 fetched_at = utc_now_iso()
-                transport = client.get_transport()
-                connection_status = (
-                    "connected"
-                    if transport is not None and transport.is_active()
-                    else "disconnected"
-                )
-
-                status = "ok"
-                if status == "ok" and connection_status == "connected":
-                    last_success_at = fetched_at
-                if latest_json_status == "ok" and connection_status == "connected":
+                last_success_at = fetched_at
+                if json_updated:
                     last_json_success_at = fetched_at
+                    save_poll_result(
+                        server=server,
+                        command=watch_command,
+                        json_command=json_command,
+                        stdout=normalized_text,
+                        stderr=text_stderr_stream,
+                        exit_code=0,
+                        status="ok",
+                        connection_status="connected",
+                        fetched_at=fetched_at,
+                        last_success_at=last_success_at,
+                        json_stdout=latest_json_text,
+                        json_exit_code=latest_json_exit_code,
+                        json_status="ok",
+                        json_last_success_at=last_json_success_at,
+                    )
+                    saved_both = True
+                else:
+                    save_text_poll_result(
+                        server=server,
+                        command=watch_command,
+                        stdout=normalized_text,
+                        stderr=text_stderr_stream,
+                        exit_code=0,
+                        status="ok",
+                        connection_status="connected",
+                        fetched_at=fetched_at,
+                        last_success_at=last_success_at,
+                    )
+                last_saved_at = now
+                if recovering:
+                    recovering = False
+                    degraded_reason = ""
+                    recovery_json_successes = 0
+                    recovery_failure_count = 0
+                    record_collector_event(
+                        server,
+                        "recovered",
+                        "two JSON confirmations and a fresh watch frame succeeded",
+                    )
+                    app.logger.info(
+                        "服务器 %s 的 gpustat 已恢复，切回正常采集",
+                        server.get("name", "unknown"),
+                    )
 
-                save_poll_result(
+            if json_updated and not saved_both:
+                fetched_at = utc_now_iso()
+                save_json_poll_result(
                     server=server,
-                    command=watch_command,
                     json_command=json_command,
-                    stdout=normalized_text,
-                    stderr=text_stderr_stream,
-                    exit_code=0 if status == "ok" else None,
-                    status=status,
-                    connection_status=connection_status,
-                    fetched_at=fetched_at,
-                    last_success_at=last_success_at,
                     json_stdout=latest_json_text,
                     json_exit_code=latest_json_exit_code,
-                    json_status=latest_json_status,
+                    json_status="ok",
+                    connection_status="connected",
+                    fetched_at=fetched_at,
                     json_last_success_at=last_json_success_at,
                 )
-                last_saved_at = now
 
             if server_stop_event.wait(0.2) or stop_event.is_set():
                 break
@@ -1401,6 +1782,13 @@ def poll_server_forever(server: dict, server_stop_event: threading.Event) -> Non
             break
         except Exception as exc:
             fetched_at = utc_now_iso()
+            if recovering:
+                degraded = True
+                recovering = False
+                degraded_reason = f"connection lost during recovery: {exc}"[:500]
+                next_recovery_attempt_at = (
+                    time.monotonic() + GPUSTAT_HEALTHY_RECOVERY_RETRY_SECONDS
+                )
             save_poll_result(
                 server=server,
                 command=watch_command,

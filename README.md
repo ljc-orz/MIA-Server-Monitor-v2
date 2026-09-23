@@ -127,9 +127,15 @@ ExecStart=/opt/gpu-server-monitor/.venv/bin/gunicorn -w 1 -b 0.0.0.0:2223 main:a
 Environment="POLL_INTERVAL_SECONDS=2"
 Environment="SSH_TIMEOUT_SECONDS=10"
 Environment="GPUSTAT_COMMAND_TIMEOUT_SECONDS=8"
+Environment="GPUSTAT_WATCH_STALE_SECONDS=15"
+Environment="GPUSTAT_SOFT_FAILURE_THRESHOLD=3"
 Environment="FALLBACK_POLL_INTERVAL_SECONDS=10"
 Environment="FALLBACK_COMMAND_TIMEOUT_SECONDS=8"
 Environment="GPUSTAT_RECOVERY_PROBE_SECONDS=300"
+Environment="GPUSTAT_HEALTHY_RECOVERY_RETRY_SECONDS=15"
+Environment="GPUSTAT_RECOVERY_CONFIRM_SUCCESSES=2"
+Environment="GPUSTAT_RECOVERY_CONFIRM_INTERVAL_SECONDS=2"
+Environment="COLLECTOR_EVENT_RETENTION_DAYS=30"
 Environment="RETENTION_MINUTES=10"
 Environment="PRUNE_INTERVAL_SECONDS=60"
 Environment="SERVER_CONFIG_REFRESH_SECONDS=2"
@@ -173,8 +179,10 @@ sudo journalctl -u gpu-monitor.service -n 200 --no-pager
 
 - 两类采样会同时写入：终端文本表 `server_readings` 和 JSON 表 `server_json_readings`。
 - `fetched_at` 记录本次状态检查时间；`last_success_at` 记录最后一次成功采集时间。断线时页面展示后者，状态灯为红色。
-- SSH 正常但 `gpustat` 在限定时间内无响应时，服务器状态变为 `degraded`。采集端停止高频调用 NVML，改用 `/sys/bus/pci/devices`、`lspci` 和可读取的 NVIDIA 内核日志判断设备是 PCI 可见、驱动未绑定、不可访问、驱动错误或已消失。降级数据默认每 10 秒更新一次，页面更新时黄灯闪烁。
-- 降级状态会写入 SQLite 并在监控进程重启后继续保持，避免重启服务反复制造卡死进程。期间会记录远端 `boot_id`；服务器重启、PCI 状态恢复，或达到默认 5 分钟的限频恢复探测周期后，程序会执行一次有超时保护的 `gpustat --json`，成功后自动恢复终端 watch 和正常页面。
+- SSH 正常但 `gpustat --json` 硬超时或连续发生多次软失败时，服务器状态变为 `degraded`。采集端停止高频调用 NVML，改用 `/sys/bus/pci/devices`、`lspci` 和可读取的 NVIDIA 内核日志判断设备是 PCI 可见、驱动未绑定、不可访问、驱动错误或已消失。降级数据默认每 10 秒更新一次，页面更新时黄灯闪烁。
+- 终端 watch 与 JSON 健康度独立判定：只要 `gpustat --json` 仍正常，watch 无首帧、停止刷新或退出只会触发自身重启，不会令整台服务器进入降级模式。
+- 降级状态会写入 SQLite 并在监控进程重启后继续保持。期间会记录远端 `boot_id`；服务器重启、PCI 状态恢复或到达限频重试时间后，程序会执行有超时保护的恢复确认，确认稳定后自动恢复终端 watch 和正常页面。
+- 状态切换、软失败、watch 重启及恢复确认会写入 `collector_events`，默认保留 30 天，便于追查短暂误报；普通采样仍按 `RETENTION_MINUTES` 清理。
 - `server_connection_state` 独立保存连接会话时间，不受采样数据清理影响：在线时页面显示本次首次在线时间，断线时显示最后一次在线时间。所有页面时间会自动转换为浏览器本地时区。
 - 程序启动时会自动创建或迁移 SQLite 表，无需手动建表。
 - 默认每 60 秒清理一次超过 10 分钟的采样数据。调整保留时间前应估算磁盘占用。
@@ -184,11 +192,14 @@ sudo journalctl -u gpu-monitor.service -n 200 --no-pager
 
 降级模式只表示 SSH 仍然可用，但无法继续从 `gpustat` 获得可信且持续更新的数据。SSH 本身断开时仍按普通断线处理，`connection_status` 为 `disconnected`，页面显示红灯，而不是进入降级模式。
 
-以下任一情况会使服务器进入 `degraded`：
+程序不查询远端进程列表、进程状态或 wait channel，也不把远端是否存在 D 状态进程作为硬故障、降级或恢复的判据。所有判断只使用本次 SSH 命令的超时/返回结果、PCI/sysfs 信息以及 NVIDIA 内核消息。
 
-- `gpustat --json` 超过 `GPUSTAT_COMMAND_TIMEOUT_SECONDS` 仍未退出。
-- `gpustat --json` 返回非零退出码、空输出或无法解析的 JSON。
-- `gpustat -P --watch` 在超时时间内没有产生首帧、已有输出停止更新，或 watch 进程提前退出。
+以下情况会使服务器进入 `degraded`：
+
+- `gpustat --json` 超过 `GPUSTAT_COMMAND_TIMEOUT_SECONDS` 仍未退出。这属于硬超时，单次发生就立即降级并关闭对应 SSH channel。
+- `gpustat --json` 返回非零退出码、空输出或无法解析的 JSON。这类软失败只有连续达到 `GPUSTAT_SOFT_FAILURE_THRESHOLD`（默认 3）次才降级；中间一次成功会把计数清零。
+
+`gpustat -P --watch` 在 `GPUSTAT_WATCH_STALE_SECONDS` 内没有产生首帧、已有输出停止更新或提前退出时，如果同期 JSON 采集仍然正常，只关闭并按退避时间重启 watch，不进入降级。如果服务器正在做恢复确认，则必须等到新 watch 产生有效终端帧才算恢复成功。
 
 进入降级模式后，采集端关闭对应的 SSH channel，停止高频运行 `gpustat`，并按照 `FALLBACK_POLL_INTERVAL_SECONDS` 执行轻量探测。探测对象是 PCI vendor 为 `0x10de`，且 PCI class 为 VGA（`0x0300`）或 3D controller（`0x0302`）的 NVIDIA 设备。设备清单取当前 sysfs、`/proc/driver/nvidia/gpus` 以及前一次降级探测已知地址的并集，因此原本存在但后来从 PCI 列表消失的设备仍能显示为 `MISSING`。
 
@@ -199,17 +210,17 @@ sudo journalctl -u gpu-monitor.service -n 200 --no-pager
 | `MISSING` | 已知 PCI 地址不再出现在当前 NVIDIA display/3D sysfs 扫描中。 | 红色 | 设备已从当前 PCI 设备列表消失。 |
 | `PCI_UNREACHABLE` | `lspci` 找不到对应地址，或读取到 PCI revision `ff`。 | 红色 | 设备节点可能仍残留，但 PCI 配置空间已经无法正常访问。 |
 | `DRIVER_UNBOUND` | PCI 设备可见，但 `/sys/bus/pci/devices/<BDF>/driver` 不是 `nvidia`，包括未绑定及绑定到其他驱动。 | 红色 | NVIDIA 驱动当前没有管理该 GPU。 |
-| `DRIVER_ERROR` | PCI 可见且绑定 `nvidia`，但最近可读取的 NVIDIA 内核日志中存在该 BDF 对应的 `NVRM`、`Xid`、`fallen off` 或 `rm_init_adapter` 信息。 | 红色 | 驱动或设备曾报告错误；日志可能是本次启动内较早发生的历史错误。 |
-| `PCI_PRESENT` | PCI/sysfs 可见、没有 `rev ff`、绑定 `nvidia`，且最近探测到的内核日志中没有该 BDF 的上述错误。 | 绿色 | 只能确认轻量检查正常，不保证 CUDA、显存或计算任务一定可用。 |
+| `DRIVER_ERROR` | PCI 可见且绑定 `nvidia`，但最近可读取的 NVIDIA 内核日志中存在该 BDF 对应的 `fallen off`、`rm_init_adapter`，或严重 Xid 79/95/119/120。 | 红色 | 驱动或设备曾报告严重错误；日志可能是本次启动内较早发生的历史错误。 |
+| `PCI_PRESENT` | PCI/sysfs 可见、没有 `rev ff`、绑定 `nvidia`，且没有上述严重内核错误。 | 绿色 | 只能确认轻量检查正常，不保证 CUDA、显存或计算任务一定可用。普通 Xid（例如 Xid 31）仍会展示，但不会单独把设备判为故障。 |
 
-`runtime_status=active`、设备 ID 和 PCI revision 仅作为辅助信息展示，不会单独证明 GPU 健康。如果远端没有安装 `lspci`，探测会退化为 sysfs 和驱动绑定检查，此时无法通过 revision `ff` 补充判断 PCI 配置空间是否可访问。降级探测刻意不调用 NVML、`nvidia-smi` 或新的 `gpustat`，因此无法提供利用率、显存、温度、功耗和 CUDA ordinal。页面中的“最后正常”来自 `last_success_at`，表示最近一次成功保存正常 `gpustat` 终端帧的时间。
+`runtime_status=active`、设备 ID 和 PCI revision 仅作为辅助信息展示，不会单独证明 GPU 健康。如果远端没有安装 `lspci`，探测会退化为 sysfs 和驱动绑定检查，此时无法通过 revision `ff` 补充判断 PCI 配置空间是否可访问。常规降级探测不调用 NVML、`nvidia-smi` 或 `gpustat`，因此无法提供利用率、显存、温度、功耗和 CUDA ordinal；只有限频的恢复确认会调用 `gpustat --json`。页面中的“最后正常”来自 `last_success_at`，表示最近一次成功保存正常 `gpustat` 终端帧的时间。
 
 自动恢复采用以下规则：
 
 - 只有所有已知设备都处于 `PCI_PRESENT` 或 `DRIVER_ERROR` 时，才允许执行一次有超时保护的 `gpustat --json` 恢复探测。允许 `DRIVER_ERROR` 是因为内核日志可能只是历史记录，最终是否恢复以 `gpustat` 实际返回为准。
-- 远端 `boot_id` 变化、设备从不可恢复状态转为上述可探测状态，或距离上次恢复尝试达到 `GPUSTAT_RECOVERY_PROBE_SECONDS` 时，触发一次恢复探测。
-- 恢复探测成功后重新启动 `gpustat -P --watch`；收到可用终端帧后，状态恢复为 `ok`，页面切回正常终端和绿灯。
-- 恢复探测失败时继续保持降级，不立即循环重试。降级状态、已知 PCI 地址和 `boot_id` 会通过最新 SQLite 采样在监控进程重启后恢复。
+- 远端 `boot_id` 变化或设备从不可恢复状态转为上述可探测状态时可立即触发恢复探测；其他健康 PCI 状态首次等待 `GPUSTAT_HEALTHY_RECOVERY_RETRY_SECONDS`（默认 15 秒）后尝试。
+- 恢复探测需要连续 `GPUSTAT_RECOVERY_CONFIRM_SUCCESSES`（默认 2）次 `gpustat --json` 成功，然后重新启动 `gpustat -P --watch`；只有收到新的有效终端帧后，状态才恢复为 `ok`，页面切回正常终端和绿灯。
+- 恢复失败时继续保持降级，重试间隔按 60 秒、`GPUSTAT_RECOVERY_PROBE_SECONDS`（默认 300 秒）退避，不立即循环重试。降级状态、已知 PCI 地址和 `boot_id` 会通过最新 SQLite 采样在监控进程重启后恢复。
 
 ## 开发与交接给 Agent
 
@@ -217,7 +228,7 @@ sudo journalctl -u gpu-monitor.service -n 200 --no-pager
 
 1. `main.py` 的 `ensure_runtime_initialized()` 在首个请求或直接启动时初始化数据库并决定当前进程是否是采集者。
 2. 每台服务器由 `poll_server_forever()` 维护一个 SSH 连接。它一边读取 watch 输出，一边周期性读取 JSON 输出。
-3. 所有一次性远程命令都必须通过带截止时间的执行函数运行。检测到 `gpustat` 卡死后不要立即循环重试，以免在远端积累不可中断的 D 状态进程。
+3. 所有一次性远程命令都必须通过带截止时间的执行函数运行。系统不执行远端进程状态扫描；判断 `gpustat` 健康度时只看命令截止时间和结果，并通过限频退避避免立即循环重试。
 4. `normalize_stream_text()` 负责清理终端控制序列。修改该部分时必须保留 SGR 颜色序列，并防止 DCS 等控制序列残留到页面。
 5. 前端没有打包工具。修改 `index.html` 后应直接检查 HTML、CSS 和浏览器控制台错误。
 6. `servers.json` 是服务器清单的唯一来源。采集端每隔 `SERVER_CONFIG_REFRESH_SECONDS`（代码默认 10 秒，部署示例配置为 2 秒）重新读取它；网页每次刷新也按其当前顺序展示服务器，因此新增、删除或改名服务器不需要修改前端代码。
