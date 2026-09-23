@@ -77,6 +77,15 @@
       animation: lampFlashOnline 1s cubic-bezier(0.2, 0.7, 0.2, 1) 1;
     }
 
+    .status-lamp.degraded {
+      background: #9ca3af;
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12), inset 0 0 4px rgba(0, 0, 0, 0.25);
+    }
+
+    .status-lamp.flash-degraded {
+      animation: lampFlashDegraded 1s cubic-bezier(0.2, 0.7, 0.2, 1) 1;
+    }
+
     .status-lamp.offline {
       background: #ef4444;
       box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12), 0 0 7px rgba(239, 68, 68, 0.75), inset 0 0 4px rgba(0, 0, 0, 0.25);
@@ -123,6 +132,57 @@
         filter: brightness(1.06);
         background: #93bba7;
         box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.14), 0 0 3px rgba(34, 197, 94, 0.18);
+      }
+
+      100% {
+        transform: scale(1);
+        filter: brightness(1);
+        background: #9ca3af;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12), inset 0 0 4px rgba(0, 0, 0, 0.25);
+      }
+    }
+
+    @keyframes lampFlashDegraded {
+      0% {
+        transform: scale(0.9);
+        filter: brightness(1);
+        background: #9ca3af;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12), inset 0 0 4px rgba(0, 0, 0, 0.25);
+      }
+
+      16% {
+        transform: scale(1.34);
+        filter: brightness(1.62);
+        background: #fbbf24;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2), 0 0 16px rgba(245, 158, 11, 0.95);
+      }
+
+      30% {
+        transform: scale(1.18);
+        filter: brightness(1.45);
+        background: #f59e0b;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2), 0 0 14px rgba(245, 158, 11, 0.86);
+      }
+
+      46% {
+        transform: scale(1.1);
+        filter: brightness(1.3);
+        background: #e3aa45;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18), 0 0 10px rgba(245, 158, 11, 0.65);
+      }
+
+      62% {
+        transform: scale(1.02);
+        filter: brightness(1.14);
+        background: #c7ad77;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16), 0 0 7px rgba(245, 158, 11, 0.4);
+      }
+
+      78% {
+        transform: scale(1.01);
+        filter: brightness(1.06);
+        background: #a9a58f;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.14), 0 0 3px rgba(245, 158, 11, 0.16);
       }
 
       100% {
@@ -733,6 +793,10 @@
       color: #ef4444;
     }
 
+    .degraded {
+      color: #d97706;
+    }
+
     .connected {
       color: #22c55e;
     }
@@ -880,18 +944,32 @@
     }
 
     function statusClass(value) {
-      return value === 'ok' ? 'ok' : 'error';
+      if (value === 'ok') {
+        return 'ok';
+      }
+      if (value === 'degraded') {
+        return 'degraded';
+      }
+      return 'error';
     }
 
     function connectionClass(value) {
       return value === 'connected' ? 'connected' : 'disconnected';
     }
 
-    function renderServerTitle(name, connectionStatus, shouldBlink) {
-      const lampClass = connectionStatus === 'disconnected'
-        ? 'status-lamp offline'
-        : (connectionStatus === 'connected' && shouldBlink ? 'status-lamp flash-online' : 'status-lamp');
-      const statusText = connectionStatus === 'connected' ? 'connected' : 'disconnected';
+    function renderServerTitle(name, connectionStatus, shouldBlink, status) {
+      let lampClass = 'status-lamp';
+      let statusText = connectionStatus === 'connected' ? 'connected' : 'disconnected';
+      if (connectionStatus === 'disconnected') {
+        lampClass = 'status-lamp offline';
+      } else if (status === 'degraded') {
+        lampClass = shouldBlink
+          ? 'status-lamp degraded flash-degraded'
+          : 'status-lamp degraded';
+        statusText = 'connected / gpustat degraded';
+      } else if (connectionStatus === 'connected' && shouldBlink) {
+        lampClass = 'status-lamp flash-online';
+      }
       return `<span class="server-title">${escapeHtml(name)} <span class="${lampClass}" title="${statusText}" aria-label="${statusText}"></span></span>`;
     }
 
@@ -954,7 +1032,7 @@
     let toastTimer = null;
     const previousFirstLineByServer = new Map();
     const previousFetchedAtByServer = new Map();
-    const terminalScrollLeftByServer = new Map();
+    const terminalScrollPositionByServer = new Map();
 
     function getFirstLine(text) {
       const value = typeof text === 'string' ? text : '';
@@ -1069,18 +1147,24 @@
       const exitCode = item && item.exit_code !== null && item.exit_code !== undefined ? String(item.exit_code) : 'null';
       const outputHtml = item && item.stdout_html ? item.stdout_html : 'NULL';
       const outputText = item && item.stdout ? item.stdout : '';
-      const blink = shouldBlinkOnFirstLineChange(name, outputText, conn);
+      const lastHealthyHtml = status === 'degraded'
+        ? `<span class="ok">最后正常: ${escapeHtml(formatBrowserTimestamp(item && item.last_success_at ? item.last_success_at : ''))}</span>`
+        : '';
+      const blink = status === 'degraded'
+        ? conn === 'connected'
+        : shouldBlinkOnFirstLineChange(name, outputText, conn);
 
       const panel = document.createElement('div');
       panel.className = 'dev_box2';
       panel.innerHTML = `
-        <h2>${renderServerTitle(name, conn, blink)}</h2>
+        <h2>${renderServerTitle(name, conn, blink, status)}</h2>
         <div class="status-line">
           <span class="${statusClass(status)}">status: ${escapeHtml(status)}</span>
           <span class="${connectionClass(conn)}">connection: ${escapeHtml(conn)}</span>
           <span>exit: ${escapeHtml(exitCode)}</span>
           <span>${escapeHtml(ip)}</span>
           <span>采样: ${escapeHtml(formatBrowserTimestamp(fetchedAt))}</span>
+          ${lastHealthyHtml}
           <span>${escapeHtml(connectionTime.label)}: ${escapeHtml(formatBrowserTimestamp(connectionTime.timestamp))}</span>
         </div>
         <div class="terminal" data-server-key="${escapeHtml(serverKey)}">
@@ -1216,7 +1300,7 @@
       const panel = document.createElement('div');
       panel.className = 'dev_box2';
       panel.innerHTML = `
-        <h2>${renderServerTitle(name, conn, blink)}</h2>
+        <h2>${renderServerTitle(name, conn, blink, status)}</h2>
         <div class="resource-summary">
           <span class="${statusClass(status)}">status: ${escapeHtml(status)}</span>
           <span class="${connectionClass(conn)}">connection: ${escapeHtml(conn)}</span>
@@ -1330,7 +1414,10 @@
       for (const terminal of terminalsBeforeRender) {
         const key = terminal.getAttribute('data-server-key') || '';
         if (key) {
-          terminalScrollLeftByServer.set(key, terminal.scrollLeft);
+          terminalScrollPositionByServer.set(key, {
+            left: terminal.scrollLeft,
+            top: terminal.scrollTop,
+          });
         }
       }
 
@@ -1343,9 +1430,10 @@
         if (!key) {
           continue;
         }
-        const savedScrollLeft = terminalScrollLeftByServer.get(key);
-        if (savedScrollLeft !== undefined) {
-          terminal.scrollLeft = savedScrollLeft;
+        const savedPosition = terminalScrollPositionByServer.get(key);
+        if (savedPosition) {
+          terminal.scrollLeft = savedPosition.left;
+          terminal.scrollTop = savedPosition.top;
         }
       }
     }

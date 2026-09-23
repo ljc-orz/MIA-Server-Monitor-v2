@@ -11,6 +11,7 @@
 - 通过 SSH 连接多台 GPU 服务器，采集 `gpustat -P --watch` 的终端视图和 `gpustat --json` 的结构化数据。
 - 网页提供控制台、资源占用排序、自动选择 GPU 的使用示例，以及更新记录弹窗。
 - 断线时显示红色状态灯，并保留最后一次成功采集的展示时间。
+- `gpustat` 卡死或超时时自动切换到 PCI/sysfs 降级探测，控制台持续显示 NVIDIA 设备状态并以黄灯提示；恢复后自动切回正常采集。
 - 每台服务器可配置专属环境变量，例如 `CUDA_DEVICE_ORDER`。
 - 采样数据保存在 SQLite，默认仅保留最近 10 分钟。
 - 使用文件锁保证多个 Gunicorn worker 或服务进程中只有一个 SSH 采集进程。
@@ -125,6 +126,10 @@ ExecStart=/opt/gpu-server-monitor/.venv/bin/gunicorn -w 1 -b 0.0.0.0:2223 main:a
 ```ini
 Environment="POLL_INTERVAL_SECONDS=2"
 Environment="SSH_TIMEOUT_SECONDS=10"
+Environment="GPUSTAT_COMMAND_TIMEOUT_SECONDS=8"
+Environment="FALLBACK_POLL_INTERVAL_SECONDS=10"
+Environment="FALLBACK_COMMAND_TIMEOUT_SECONDS=8"
+Environment="GPUSTAT_RECOVERY_PROBE_SECONDS=300"
 Environment="RETENTION_MINUTES=10"
 Environment="PRUNE_INTERVAL_SECONDS=60"
 Environment="SERVER_CONFIG_REFRESH_SECONDS=2"
@@ -168,6 +173,8 @@ sudo journalctl -u gpu-monitor.service -n 200 --no-pager
 
 - 两类采样会同时写入：终端文本表 `server_readings` 和 JSON 表 `server_json_readings`。
 - `fetched_at` 记录本次状态检查时间；`last_success_at` 记录最后一次成功采集时间。断线时页面展示后者，状态灯为红色。
+- SSH 正常但 `gpustat` 在限定时间内无响应时，服务器状态变为 `degraded`。采集端停止高频调用 NVML，改用 `/sys/bus/pci/devices`、`lspci` 和可读取的 NVIDIA 内核日志判断设备是 PCI 可见、驱动未绑定、不可访问、驱动错误或已消失。降级数据默认每 10 秒更新一次，页面更新时黄灯闪烁。
+- 降级状态会写入 SQLite 并在监控进程重启后继续保持，避免重启服务反复制造卡死进程。期间会记录远端 `boot_id`；服务器重启、PCI 状态恢复，或达到默认 5 分钟的限频恢复探测周期后，程序会执行一次有超时保护的 `gpustat --json`，成功后自动恢复终端 watch 和正常页面。
 - `server_connection_state` 独立保存连接会话时间，不受采样数据清理影响：在线时页面显示本次首次在线时间，断线时显示最后一次在线时间。所有页面时间会自动转换为浏览器本地时区。
 - 程序启动时会自动创建或迁移 SQLite 表，无需手动建表。
 - 默认每 60 秒清理一次超过 10 分钟的采样数据。调整保留时间前应估算磁盘占用。
@@ -179,9 +186,10 @@ sudo journalctl -u gpu-monitor.service -n 200 --no-pager
 
 1. `main.py` 的 `ensure_runtime_initialized()` 在首个请求或直接启动时初始化数据库并决定当前进程是否是采集者。
 2. 每台服务器由 `poll_server_forever()` 维护一个 SSH 连接。它一边读取 watch 输出，一边周期性读取 JSON 输出。
-3. `normalize_stream_text()` 负责清理终端控制序列。修改该部分时必须保留 SGR 颜色序列，并防止 DCS 等控制序列残留到页面。
-4. 前端没有打包工具。修改 `index.html` 后应直接检查 HTML、CSS 和浏览器控制台错误。
-5. `servers.json` 是服务器清单的唯一来源。采集端每隔 `SERVER_CONFIG_REFRESH_SECONDS`（默认 2 秒）重新读取它；网页每次刷新也按其当前顺序展示服务器，因此新增、删除或改名服务器不需要修改前端代码。
+3. 所有一次性远程命令都必须通过带截止时间的执行函数运行。检测到 `gpustat` 卡死后不要立即循环重试，以免在远端积累不可中断的 D 状态进程。
+4. `normalize_stream_text()` 负责清理终端控制序列。修改该部分时必须保留 SGR 颜色序列，并防止 DCS 等控制序列残留到页面。
+5. 前端没有打包工具。修改 `index.html` 后应直接检查 HTML、CSS 和浏览器控制台错误。
+6. `servers.json` 是服务器清单的唯一来源。采集端每隔 `SERVER_CONFIG_REFRESH_SECONDS`（代码默认 10 秒，部署示例配置为 2 秒）重新读取它；网页每次刷新也按其当前顺序展示服务器，因此新增、删除或改名服务器不需要修改前端代码。
 
 ### 修改约定
 
