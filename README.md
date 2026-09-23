@@ -180,6 +180,37 @@ sudo journalctl -u gpu-monitor.service -n 200 --no-pager
 - 默认每 60 秒清理一次超过 10 分钟的采样数据。调整保留时间前应估算磁盘占用。
 - `collector.lock` 只协调本机同一项目目录下的进程；若部署多台监控机，它们会分别采集。
 
+### 降级状态判定规则
+
+降级模式只表示 SSH 仍然可用，但无法继续从 `gpustat` 获得可信且持续更新的数据。SSH 本身断开时仍按普通断线处理，`connection_status` 为 `disconnected`，页面显示红灯，而不是进入降级模式。
+
+以下任一情况会使服务器进入 `degraded`：
+
+- `gpustat --json` 超过 `GPUSTAT_COMMAND_TIMEOUT_SECONDS` 仍未退出。
+- `gpustat --json` 返回非零退出码、空输出或无法解析的 JSON。
+- `gpustat -P --watch` 在超时时间内没有产生首帧、已有输出停止更新，或 watch 进程提前退出。
+
+进入降级模式后，采集端关闭对应的 SSH channel，停止高频运行 `gpustat`，并按照 `FALLBACK_POLL_INTERVAL_SECONDS` 执行轻量探测。探测对象是 PCI vendor 为 `0x10de`，且 PCI class 为 VGA（`0x0300`）或 3D controller（`0x0302`）的 NVIDIA 设备。设备清单取当前 sysfs、`/proc/driver/nvidia/gpus` 以及前一次降级探测已知地址的并集，因此原本存在但后来从 PCI 列表消失的设备仍能显示为 `MISSING`。
+
+单个设备按以下优先级判定，前面的规则优先：
+
+| 降级状态 | 判定条件 | 页面颜色 | 含义 |
+| --- | --- | --- | --- |
+| `MISSING` | 已知 PCI 地址不再出现在当前 NVIDIA display/3D sysfs 扫描中。 | 红色 | 设备已从当前 PCI 设备列表消失。 |
+| `PCI_UNREACHABLE` | `lspci` 找不到对应地址，或读取到 PCI revision `ff`。 | 红色 | 设备节点可能仍残留，但 PCI 配置空间已经无法正常访问。 |
+| `DRIVER_UNBOUND` | PCI 设备可见，但 `/sys/bus/pci/devices/<BDF>/driver` 不是 `nvidia`，包括未绑定及绑定到其他驱动。 | 红色 | NVIDIA 驱动当前没有管理该 GPU。 |
+| `DRIVER_ERROR` | PCI 可见且绑定 `nvidia`，但最近可读取的 NVIDIA 内核日志中存在该 BDF 对应的 `NVRM`、`Xid`、`fallen off` 或 `rm_init_adapter` 信息。 | 红色 | 驱动或设备曾报告错误；日志可能是本次启动内较早发生的历史错误。 |
+| `PCI_PRESENT` | PCI/sysfs 可见、没有 `rev ff`、绑定 `nvidia`，且最近探测到的内核日志中没有该 BDF 的上述错误。 | 绿色 | 只能确认轻量检查正常，不保证 CUDA、显存或计算任务一定可用。 |
+
+`runtime_status=active`、设备 ID 和 PCI revision 仅作为辅助信息展示，不会单独证明 GPU 健康。如果远端没有安装 `lspci`，探测会退化为 sysfs 和驱动绑定检查，此时无法通过 revision `ff` 补充判断 PCI 配置空间是否可访问。降级探测刻意不调用 NVML、`nvidia-smi` 或新的 `gpustat`，因此无法提供利用率、显存、温度、功耗和 CUDA ordinal。页面中的“最后正常”来自 `last_success_at`，表示最近一次成功保存正常 `gpustat` 终端帧的时间。
+
+自动恢复采用以下规则：
+
+- 只有所有已知设备都处于 `PCI_PRESENT` 或 `DRIVER_ERROR` 时，才允许执行一次有超时保护的 `gpustat --json` 恢复探测。允许 `DRIVER_ERROR` 是因为内核日志可能只是历史记录，最终是否恢复以 `gpustat` 实际返回为准。
+- 远端 `boot_id` 变化、设备从不可恢复状态转为上述可探测状态，或距离上次恢复尝试达到 `GPUSTAT_RECOVERY_PROBE_SECONDS` 时，触发一次恢复探测。
+- 恢复探测成功后重新启动 `gpustat -P --watch`；收到可用终端帧后，状态恢复为 `ok`，页面切回正常终端和绿灯。
+- 恢复探测失败时继续保持降级，不立即循环重试。降级状态、已知 PCI 地址和 `boot_id` 会通过最新 SQLite 采样在监控进程重启后恢复。
+
 ## 开发与交接给 Agent
 
 ### 架构要点
